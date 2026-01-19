@@ -1,0 +1,390 @@
+@page "/monitor"
+@rendermode InteractiveServer
+@inject ModbusDataService ModbusService
+@implements IDisposable
+
+<PageTitle>烤箱數據監控</PageTitle>
+
+<div class="monitor-container">
+    <!-- 頂部標題與狀態彙整 -->
+    <div class="header-section">
+        <div class="d-flex justify-content-between align-items-center">
+            <h1 class="page-title mb-0">
+                <span class="icon-oven">🔥</span> 烤箱數據監控系統
+            </h1>
+            
+            <div class="top-toolbar">
+                <div class="stat-summary">
+                    <div class="stat-item">
+                        <span class="stat-dot dot-online"></span>
+                        <span>@(ModbusService.DiStatus.Take(12).Count(x => x)) 運行中</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-dot dot-error"></span>
+                        <span>@(ModbusService.TemperatureErrors.Count(e => !string.IsNullOrEmpty(e))) 異常</span>
+                    </div>
+                </div>
+
+                <div class="zoom-control">
+                    <span style="font-size: 0.7rem; color: #86868b;">縮放</span>
+                    <input class="zoom-range" type="range" min="0.7" max="1.3" step="0.05" @bind="TempZoom" />
+                </div>
+
+                <div class="status-badge">
+                    @if (ModbusService.IsConnected)
+                    {
+                        <span class="badge bg-success badge-sm px-2 py-1" style="border-radius: 6px;">已連線</span>
+                    }
+                    else
+                    {
+                        <span class="badge bg-danger badge-sm px-2 py-1" style="border-radius: 6px;">未連線</span>
+                    }
+                </div>
+            </div>
+        </div>
+        
+        <div class="info-bar">
+            <div class="info-item">
+                <span class="info-label">設備 IP:</span>
+                <span class="info-value">192.168.61.144:4196</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">最後更新:</span>
+                <span class="info-value">
+                    @if (ModbusService.LastUpdateTime != DateTime.MinValue)
+                    {
+                        @ModbusService.LastUpdateTime.ToString("HH:mm:ss")
+                    }
+                    else
+                    {
+                        <text>等待連線...</text>
+                    }
+                </span>
+            </div>
+        </div>
+
+        @if (!ModbusService.IsConnected)
+        {
+            <div class="alert alert-warning alert-horizontal mt-2 mb-0" role="alert">
+                <div class="d-flex align-items-center flex-wrap">
+                    <span class="alert-icon me-2">⚠️</span>
+                    <strong class="me-3">設備未連線</strong>
+                    <span class="error-hint me-3">請檢查網路、IP (192.168.61.144) 或 Port (4196)</span>
+                    
+                    @if (!string.IsNullOrEmpty(ModbusService.ErrorMessage))
+                    {
+                        <div class="error-detail-inline">
+                            <span class="detail-label">詳情:</span>
+                            <span class="detail-text">@FormatErrorMessage(ModbusService.ErrorMessage)</span>
+                        </div>
+                    }
+                </div>
+            </div>
+        }
+    </div>
+
+    @if (ModbusService.IsConnected)
+    {
+        <div class="dashboard-grid" style="zoom: @TempZoom.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture);">
+            
+            <!-- 1 & 2: 後跟定型 (冷/熱) -->
+            <div class="category-section">
+                <div class="category-header">
+                    <span class="category-icon">👞</span>
+                    <span class="category-title">後跟定型 (Heel Molding)</span>
+                </div>
+                <div class="station-grid-small">
+                    <!-- 冷定型 -->
+                    @foreach (var stationId in new[] { 11, 10 })
+                    {
+                        @RenderStationCard(stationId, "type-cold")
+                    }
+                    <!-- 熱定型 -->
+                    @foreach (var stationId in new[] { 12, 9 })
+                    {
+                        @RenderStationCard(stationId, "type-heat")
+                    }
+                </div>
+            </div>
+
+            <!-- 3: 高速加熱定型機 -->
+            <div class="category-section">
+                <div class="category-header">
+                    <span class="category-icon">⚡</span>
+                    <span class="category-title">高速加熱定型機 (High Speed)</span>
+                </div>
+                <div class="station-grid-small">
+                    @RenderStationCard(1, "type-heat")
+                </div>
+            </div>
+
+            <!-- 4 ~ 9: 藥水箱與膠類 (橫向展開) -->
+            <div class="category-section full-width-section">
+                <div class="category-header">
+                    <span class="category-icon">💧</span>
+                    <span class="category-title">藥水箱與膠水活化 (Chemicals & Glues)</span>
+                </div>
+                <div class="station-grid-small" style="grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));">
+                    @foreach (var stationId in new[] { 2, 3, 4, 5, 6, 7 })
+                    {
+                        @RenderStationCard(stationId, "type-aux")
+                    }
+                </div>
+            </div>
+
+            <!-- 10: 冷凍機 (獨立最下方區塊) -->
+            <div class="category-section full-width-section">
+                <div class="category-header">
+                    <span class="category-icon">❄️</span>
+                    <span class="category-title">冷凍系統 (Freezer System)</span>
+                </div>
+                <div class="station-grid-small">
+                    @RenderStationCard(8, "type-cold")
+                </div>
+            </div>
+        </div>
+    }
+</div>
+
+@code {
+    private double TempZoom { get; set; } = 1.0;
+    private System.Threading.Timer? _timer;
+    private bool _isDisposed = false;
+
+    private RenderFragment RenderStationCard(int stationId, string typeClass)
+    {
+        var index = stationId - 1;
+        var sensorInfo = ModbusDataService.GetSensorInfo(stationId);
+        var diIsOn = ModbusService.DiStatus.Count > index && ModbusService.DiStatus[index];
+        var temp = ModbusService.Temperatures.Count > index ? ModbusService.Temperatures[index] : 0;
+        var error = ModbusService.TemperatureErrors.Count > index ? ModbusService.TemperatureErrors[index] : null;
+        var cardClass = !string.IsNullOrEmpty(error) ? "station-error" : "";
+
+        return __builder => {
+            <div class="station-card @typeClass @cardClass">
+                <div class="station-header">
+                    <span class="station-id">#@stationId</span>
+                    <div class="station-di">
+                        <div class="status-light @(diIsOn ? "light-on" : "light-off")"></div>
+                        <span class="di-text">@(diIsOn ? "Running" : "Standby")</span>
+                    </div>
+                </div>
+                <div class="station-info">
+                    <div class="station-device">@(sensorInfo?.Device ?? "未知設備")</div>
+                    <div class="station-position">@(sensorInfo?.Position ?? "-")</div>
+                </div>
+                <div class="station-temp">
+                    <span class="temp-value-lg">@temp.ToString("F1")</span>
+                    <span class="temp-unit-lg">°C</span>
+                </div>
+                @if (!string.IsNullOrEmpty(error))
+                {
+                    <div class="station-error-message">⚠️ @FormatErrorMessage(error)</div>
+                }
+            </div>
+        };
+    }
+
+    private string FormatErrorMessage(string rawError)
+    {
+        if (string.IsNullOrEmpty(rawError)) return "";
+        if (rawError.Contains("function code is invalid")) return "通訊協議錯誤";
+        if (rawError.Contains("timeout")) return "感測器無回應";
+        if (rawError.Contains("connection")) return "網路連線中斷";
+        return "數據異常";
+    }
+
+    protected override void OnInitialized()
+    {
+        ModbusService.DataUpdated += OnDataUpdated;
+        _timer = new System.Threading.Timer(async _ =>
+        {
+            if (!_isDisposed)
+            {
+                await InvokeAsync(StateHasChanged);
+            }
+        }, null, 0, 500);
+    }
+
+    private async void OnDataUpdated()
+    {
+        if (!_isDisposed)
+        {
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    public void Dispose()
+    {
+        _isDisposed = true;
+        ModbusService.DataUpdated -= OnDataUpdated;
+        _timer?.Dispose();
+    }
+}
+
+<style>
+    .monitor-container {
+        padding: 0.75rem 1rem;
+        max-width: 100%;
+        margin: 0 auto;
+        background: #f0f2f5;
+        min-height: 100vh;
+        font-size: 0.85rem;
+        color: #1d1d1f;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    .header-section {
+        background: rgba(255, 255, 255, 0.8);
+        backdrop-filter: blur(20px);
+        -webkit-backdrop-filter: blur(20px);
+        border-radius: 12px;
+        padding: 0.75rem 1.25rem;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+        margin-bottom: 0.75rem;
+        border: 1px solid rgba(255, 255, 255, 0.3);
+        position: relative;
+    }
+
+    .page-title {
+        font-size: 1.1rem;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+    }
+
+    .info-bar {
+        display: flex;
+        gap: 1.5rem;
+        margin-top: 0.5rem;
+        padding-top: 0.5rem;
+        border-top: 1px solid rgba(0, 0, 0, 0.05);
+    }
+
+    .info-item { display: flex; gap: 0.4rem; }
+    .info-label { font-weight: 500; color: #86868b; font-size: 0.75rem; }
+    .info-value { color: #424245; font-size: 0.75rem; font-weight: 600; }
+
+    .top-toolbar {
+        position: absolute;
+        right: 1.25rem;
+        top: 0.75rem;
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+    }
+
+    .stat-summary {
+        display: flex;
+        gap: 0.75rem;
+        font-size: 0.75rem;
+        font-weight: 600;
+    }
+
+    .stat-item { display: flex; align-items: center; gap: 0.25rem; }
+    .stat-dot { width: 6px; height: 6px; border-radius: 50%; }
+    .dot-online { background: #34c759; }
+    .dot-error { background: #ff3b30; }
+
+    .zoom-control {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        background: #f5f5f7;
+        padding: 0.2rem 0.5rem;
+        border-radius: 6px;
+    }
+
+    .zoom-range { width: 60px; height: 4px; }
+
+    .dashboard-grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 0.75rem;
+    }
+
+    .full-width-section { grid-column: span 2; }
+
+    .category-section {
+        background: rgba(255, 255, 255, 0.6);
+        border-radius: 12px;
+        padding: 0.75rem;
+        border: 1px solid rgba(255, 255, 255, 0.4);
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.02);
+    }
+
+    .category-header {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-bottom: 0.75rem;
+        padding-bottom: 0.5rem;
+        border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+    }
+
+    .category-title { font-size: 0.85rem; font-weight: 600; color: #424245; }
+
+    .station-grid-small {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+        gap: 0.6rem;
+    }
+
+    .station-card {
+        background: white;
+        border-radius: 10px;
+        padding: 0.6rem;
+        border: 1px solid rgba(0, 0, 0, 0.05);
+        transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+        position: relative;
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        min-height: 95px;
+    }
+
+    .station-card::after {
+        content: '';
+        position: absolute;
+        left: 0; top: 0; bottom: 0;
+        width: 4px;
+        background: #d2d2d7;
+    }
+
+    .type-heat::after { background: #ff453a; }
+    .type-cold::after { background: #0a84ff; }
+    .type-aux::after { background: #5e5ce6; }
+
+    .station-card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 8px 16px rgba(0, 0, 0, 0.08);
+    }
+
+    .station-header { display: flex; justify-content: space-between; align-items: flex-start; }
+    .station-id { font-size: 0.65rem; font-weight: 700; color: #86868b; background: #f5f5f7; padding: 0.1rem 0.35rem; border-radius: 4px; }
+    
+    .status-light { width: 7px; height: 7px; border-radius: 50%; margin-bottom: 2px; margin-left: auto; }
+    .light-on { background: #34c759; box-shadow: 0 0 6px #34c759; }
+    .light-off { background: #d2d2d7; }
+    .di-text { font-size: 0.55rem; font-weight: 600; color: #86868b; text-align: right; }
+
+    .station-device { font-size: 0.8rem; font-weight: 600; color: #1d1d1f; }
+    .station-position { font-size: 0.7rem; color: #86868b; }
+
+    .station-temp { display: flex; align-items: baseline; gap: 1px; margin-top: 0.25rem; }
+    .temp-value-lg { font-size: 1.5rem; font-weight: 700; color: #1d1d1f; letter-spacing: -0.02em; line-height: 1; }
+    .temp-unit-lg { font-size: 0.7rem; font-weight: 500; color: #86868b; margin-left: 1px; }
+
+    .station-error { background: #fff2f2; border-color: #ffbaba; }
+    .station-error::after { background: #ff3b30; }
+    .station-error-message { font-size: 0.6rem; color: #ff3b30; background: rgba(255, 59, 48, 0.1); padding: 0.15rem 0.3rem; border-radius: 4px; margin-top: 0.3rem; font-weight: 500; }
+
+    .alert-horizontal { padding: 0.4rem 0.75rem; border-radius: 8px; border: none; border-left: 4px solid #ffc107; background-color: #fff9e6; font-size: 0.75rem; display: flex; align-items: center; }
+    .error-detail-inline { display: flex; gap: 0.4rem; margin-left: auto; padding-left: 0.75rem; border-left: 1px solid rgba(0,0,0,0.1); }
+    .detail-text { font-family: monospace; color: #ff3b30; }
+
+    @@media (max-width: 1200px) {
+        .dashboard-grid { grid-template-columns: 1fr; }
+        .full-width-section { grid-column: auto; }
+    }
+</style>

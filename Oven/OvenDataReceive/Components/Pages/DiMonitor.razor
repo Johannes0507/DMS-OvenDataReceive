@@ -1,0 +1,513 @@
+@page "/di-monitor"
+@rendermode InteractiveServer
+@inject ModbusDataService ModbusService
+@implements IDisposable
+
+<PageTitle>其他開關量監控</PageTitle>
+
+<div class="monitor-container">
+    <div class="header-section">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+            <h1 class="page-title">
+                <span class="icon-oven">📊</span> 其他開關量監控
+            </h1>
+            <div class="status-badge">
+                @if (ModbusService.IsConnected)
+                {
+                    <span class="badge bg-success badge-sm px-2 py-1">
+                        <span class="status-dot"></span> 已連線
+                    </span>
+                }
+                else
+                {
+                    <span class="badge bg-danger badge-sm px-2 py-1">
+                        <span class="status-dot"></span> 未連線
+                    </span>
+                }
+            </div>
+        </div>
+
+        <div class="info-bar">
+            <div class="info-item">
+                <span class="info-label">設備 IP:</span>
+                <span class="info-value">192.168.61.144:4196</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">最後更新:</span>
+                <span class="info-value">
+                    @if (ModbusService.LastUpdateTime != DateTime.MinValue)
+                    {
+                        <span class="update-time">@ModbusService.LastUpdateTime.ToString("yyyy-MM-dd HH:mm:ss")</span>
+                        <span class="update-indicator">●</span>
+                    }
+                    else
+                    {
+                        <text>等待連線...</text>
+                    }
+                </span>
+            </div>
+        </div>
+
+        @if (!ModbusService.IsConnected)
+        {
+            <div class="alert alert-warning alert-custom mt-3" role="alert">
+                <div class="d-flex align-items-start">
+                    <span class="alert-icon me-2">⚠️</span>
+                    <div>
+                        <strong>設備未連線</strong>
+                        <p class="mb-0 mt-2">
+                            無法連接到 Modbus 設備。請檢查：
+                        </p>
+                        <ul class="mb-0 mt-2">
+                            <li>設備是否已開啟並連接到網路</li>
+                            <li>IP 位址 (192.168.61.144) 是否正確</li>
+                            <li>Port (4196) 是否正確</li>
+                        </ul>
+                        @if (!string.IsNullOrEmpty(ModbusService.ErrorMessage))
+                        {
+                            <hr class="my-2" />
+                            <small class="text-muted">錯誤詳情: @ModbusService.ErrorMessage</small>
+                        }
+                    </div>
+                </div>
+            </div>
+        }
+    </div>
+
+    @if (ModbusService.IsConnected && ModbusService.DiStatus.Count > 12)
+    {
+        <details class="section-card di-collapsible" open>
+            <summary class="section-header">
+                <h2 class="section-title">
+                    <span class="section-icon">📊</span> 其他開關量 (DI13-DI32)
+                </h2>
+                <span class="section-count">@(ModbusService.DiStatus.Count - 12) 個</span>
+                <span class="toggle-hint">點開查看</span>
+            </summary>
+            <div class="zoom-toolbar di-zoom-toolbar">
+                <div class="zoom-label">開關量縮放</div>
+                <input class="zoom-range" type="range" min="0.7" max="1.6" step="0.05" @bind="DiZoom" />
+                <div class="zoom-value">@($"{DiZoom:0.00}x")</div>
+            </div>
+            <div class="di-zoom-area" style="--di-zoom: @(DiZoom.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));">
+                <div class="di-grid">
+                    @for (int i = 12; i < ModbusService.DiStatus.Count; i++)
+                    {
+                        var index = i;
+                        var isActive = ModbusService.DiStatus[index];
+                        <div class="di-card @(isActive ? "di-active" : "di-inactive")">
+                            <div class="di-indicator">
+                                <div class="di-light @(isActive ? "light-on" : "light-off")"></div>
+                            </div>
+                            <div class="di-label">DI@((index + 1).ToString("D2"))</div>
+                            <div class="di-status">@(isActive ? "ON" : "OFF")</div>
+                        </div>
+                    }
+                </div>
+            </div>
+        </details>
+    }
+    else if (ModbusService.IsConnected)
+    {
+        <div class="section-card">
+            <div class="section-header">
+                <h2 class="section-title">
+                    <span class="section-icon">📊</span> 其他開關量 (DI13-DI32)
+                </h2>
+                <span class="section-count">0 個</span>
+            </div>
+            <div class="text-muted">目前沒有 DI13 之後的開關量資料。</div>
+        </div>
+    }
+</div>
+
+<style>
+    .monitor-container {
+        padding: 1.25rem 1.5rem;
+        max-width: 100%;
+        margin: 0 auto;
+        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+        min-height: 100vh;
+        font-size: 0.9rem;
+    }
+
+    .header-section {
+        background: white;
+        border-radius: 12px;
+        padding: 1.5rem;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        margin-bottom: 1.5rem;
+    }
+
+    .page-title {
+        font-size: 1.75rem;
+        font-weight: 700;
+        margin: 0;
+    }
+
+    .icon-oven {
+        font-size: 1.75rem;
+        margin-right: 0.5rem;
+    }
+
+    .badge-sm {
+        font-size: 0.85rem;
+    }
+
+    .status-badge .badge {
+        border-radius: 25px;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+
+    .status-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: currentColor;
+        display: inline-block;
+        animation: pulse 2s infinite;
+    }
+
+    @@keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.5; }
+    }
+
+    .info-bar {
+        display: flex;
+        gap: 2rem;
+        margin-top: 1rem;
+        padding-top: 1rem;
+        border-top: 1px solid #e0e0e0;
+    }
+
+    .info-item {
+        display: flex;
+        gap: 0.5rem;
+    }
+
+    .info-label {
+        font-weight: 600;
+        color: #666;
+        font-size: 0.85rem;
+    }
+
+    .info-value {
+        color: #333;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        font-size: 0.85rem;
+    }
+
+    .update-time {
+        font-family: 'Courier New', monospace;
+        font-size: 0.85rem;
+    }
+
+    .update-indicator {
+        color: #28a745;
+        font-size: 0.7rem;
+        animation: blink 1s infinite;
+    }
+
+    @@keyframes blink {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.3; }
+    }
+
+    .alert-custom {
+        border-radius: 10px;
+        border-left: 4px solid #ffc107;
+        font-size: 0.85rem;
+    }
+
+    .alert-icon {
+        font-size: 1.25rem;
+    }
+
+    .section-card {
+        background: white;
+        border-radius: 12px;
+        padding: 1.25rem;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        margin-bottom: 1.5rem;
+    }
+
+    .section-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 1rem;
+        padding-bottom: 0.75rem;
+        border-bottom: 2px solid #f0f0f0;
+    }
+
+    .section-title {
+        font-size: 1.25rem;
+        font-weight: 600;
+        margin: 0;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+
+    .section-icon {
+        font-size: 1.5rem;
+    }
+
+    .section-count {
+        color: #666;
+        font-size: 0.85rem;
+    }
+
+    .zoom-toolbar {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.5rem 0.75rem;
+        background: #f8f9fb;
+        border-radius: 10px;
+        border: 1px dashed #d0d7de;
+        margin-bottom: 1rem;
+    }
+
+    .zoom-label {
+        font-size: 0.85rem;
+        font-weight: 600;
+        color: #555;
+        white-space: nowrap;
+    }
+
+    .zoom-range {
+        flex: 1;
+        accent-color: #0d6efd;
+    }
+
+    .zoom-value {
+        font-size: 0.85rem;
+        color: #333;
+        min-width: 3rem;
+        text-align: right;
+        font-weight: 600;
+    }
+
+    .di-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+        gap: 0.75rem;
+    }
+
+    .di-collapsible {
+        padding: 0;
+    }
+
+    .di-collapsible .section-header {
+        margin-bottom: 0;
+        padding: 0.75rem 1.25rem;
+        border-bottom: none;
+        cursor: pointer;
+        list-style: none;
+    }
+
+    .di-collapsible .section-header::-webkit-details-marker {
+        display: none;
+    }
+
+    .di-collapsible .section-header::after {
+        content: "▾";
+        margin-left: auto;
+        font-size: 1rem;
+        color: #555;
+        transition: transform 0.2s ease;
+    }
+
+    .di-collapsible[open] .section-header::after {
+        transform: rotate(180deg);
+    }
+
+    .toggle-hint {
+        font-size: 0.75rem;
+        color: #888;
+        margin-left: 0.5rem;
+    }
+
+    .di-zoom-toolbar {
+        margin: 0.75rem 1.25rem 1rem;
+    }
+
+    .di-zoom-area {
+        --di-zoom: 1;
+        zoom: var(--di-zoom);
+        transform-origin: top center;
+        padding: 0 1.25rem 1.25rem;
+    }
+
+    @@supports not (zoom: 1) {
+        .di-zoom-area {
+            transform: scale(var(--di-zoom));
+            width: calc(100% / var(--di-zoom));
+        }
+    }
+
+    .di-card {
+        background: white;
+        border: 2px solid #e0e0e0;
+        border-radius: 10px;
+        padding: 0.75rem;
+        text-align: center;
+        transition: all 0.3s ease;
+        cursor: pointer;
+    }
+
+    .di-card:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15);
+    }
+
+    .di-active {
+        border-color: #28a745;
+        background: linear-gradient(135deg, #d4edda 0%, #c3e6cb 100%);
+    }
+
+    .di-inactive {
+        border-color: #6c757d;
+        background: #f8f9fa;
+    }
+
+    .di-indicator {
+        margin-bottom: 0.5rem;
+    }
+
+    .di-light {
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        margin: 0 auto;
+        transition: all 0.3s ease;
+    }
+
+    .light-on {
+        background: #28a745;
+        box-shadow: 0 0 15px rgba(40, 167, 69, 0.6);
+    }
+
+    .light-off {
+        background: #6c757d;
+        opacity: 0.5;
+    }
+
+    .di-label {
+        font-weight: 600;
+        color: #333;
+        margin-bottom: 0.25rem;
+        font-size: 0.85rem;
+    }
+
+    .di-status {
+        font-size: 0.75rem;
+        font-weight: 600;
+    }
+
+    .di-active .di-status {
+        color: #28a745;
+    }
+
+    .di-inactive .di-status {
+        color: #6c757d;
+    }
+
+    @@media (max-width: 768px) {
+        .monitor-container {
+            padding: 1rem;
+        }
+
+        .info-bar {
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .zoom-toolbar {
+            flex-direction: column;
+            align-items: stretch;
+        }
+
+        .zoom-value {
+            text-align: left;
+        }
+    }
+</style>
+
+@code {
+    private System.Threading.Timer? _timer;
+    private bool _isDisposed = false;
+    private DateTime _lastRenderTime = DateTime.Now;
+    private double DiZoom { get; set; } = 1.0;
+
+    protected override void OnInitialized()
+    {
+        ModbusService.DataUpdated += OnDataUpdated;
+
+        _timer = new System.Threading.Timer(async _ =>
+        {
+            if (!_isDisposed)
+            {
+                try
+                {
+                    await InvokeAsync(() =>
+                    {
+                        if (!_isDisposed)
+                        {
+                            StateHasChanged();
+                            _lastRenderTime = DateTime.Now;
+                        }
+                    });
+                }
+                catch (ObjectDisposedException)
+                {
+                    _isDisposed = true;
+                }
+            }
+        }, null, 0, 100);
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            await Task.Delay(100);
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private async void OnDataUpdated()
+    {
+        if (!_isDisposed)
+        {
+            try
+            {
+                await InvokeAsync(() =>
+                {
+                    if (!_isDisposed)
+                    {
+                        StateHasChanged();
+                        _lastRenderTime = DateTime.Now;
+                    }
+                });
+            }
+            catch (ObjectDisposedException)
+            {
+                _isDisposed = true;
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        _isDisposed = true;
+        ModbusService.DataUpdated -= OnDataUpdated;
+        _timer?.Dispose();
+    }
+}

@@ -1,0 +1,13 @@
+<Router AppAssembly="@typeof(App).Assembly">
+    <Found Context="routeData">
+        <RouteView RouteData="@routeData" DefaultLayout="@typeof(OvenDataReceive.Shared.MainLayout)" />
+        <FocusOnNavigate RouteData="@routeData" Selector="h1" />
+    </Found>
+    <NotFound>
+        <PageTitle>找不到頁面</PageTitle>
+        <LayoutView Layout="@typeof(OvenDataReceive.Shared.MainLayout)">
+            <p role="alert">抱歉，找不到此頁面。</p>
+        </LayoutView>
+    </NotFound>
+</Router>
+

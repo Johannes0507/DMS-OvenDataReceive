@@ -1,0 +1,43 @@
+# Visual Studio / VS Code
+.vs/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.cache
+*.log
+
+# .NET build outputs
+**/bin/
+**/obj/
+*.dll
+*.exe
+*.pdb
+*.deps.json
+*.runtimeconfig.json
+*.csproj.user
+*.csproj.nuget.dgspec.json
+*.csproj.nuget.g.props
+*.csproj.nuget.g.targets
+
+# Rider
+.idea/
+
+# OS / tooling
+.DS_Store
+Thumbs.db
+
+# App secrets / env
+**/appsettings.Development.json
+**/appsettings.*.local.json
+**/*.secrets.json
+
+# Logs / data dumps
+**/Logs/
+**/*.txt
+**/*.log
+
+# Test artifacts
+**/TestResults/
+*.zip

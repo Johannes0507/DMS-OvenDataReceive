@@ -1,0 +1,86 @@
+html, body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+#blazor-error-ui {
+    background: lightyellow;
+    bottom: 0;
+    box-shadow: 0 -1px 2px rgba(0, 0, 0, 0.2);
+    display: none;
+    left: 0;
+    padding: 0.6rem 1.25rem 0.7rem 1.25rem;
+    position: fixed;
+    width: 100%;
+    z-index: 1000;
+}
+
+    #blazor-error-ui .dismiss {
+        cursor: pointer;
+        position: absolute;
+        right: 0.75rem;
+        top: 0.5rem;
+    }
+
+.blazor-error-boundary {
+    background: url(data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNTYiIGhlaWdodD0iNDkiIHZpZXdCb3g9IjAgMCA1NiA0OSIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTEzLjUgNi41TDIwLjUgMi41TDI3LjUgNi41VjEwLjVIMTMuNVY2LjVaIiBzdHJva2U9IiNGRkU1MDAiIGZpbGw9IiNGRkU1MDAiLz4KPHBhdGggZD0iTTMuNSA2LjVIMTMuNVYxMC41SDMuNVY2LjVaIiBzdHJva2U9IiNGRkU1MDAiIGZpbGw9IiNGRkU1MDAiLz4KPHBhdGggZD0iTTI3LjUgNi41VjEwLjVIMzYuNVY2LjVIMjcuNVoiIHN0cm9rZT0iI0ZGRTUwMCIgZmlsbD0iI0ZGRTUwMCIvPgo8cGF0aCBkPSJNMy41IDEwLjVWNDAuNUg1Mi41VjEwLjVIMy41WiIgc3Ryb2tlPSIjRkZFNTAwIiBmaWxsPSIjRkZFNTAwIi8+CjxwYXRoIGQ9Ik0xMy41IDEwLjVWNDAuNUgyNy41VjEwLjVIMTMuNVoiIGZpbGw9IiNGRkZGRkYiLz4KPHBhdGggZD0iTTEzLjUgMTAuNVY0MC41SDI3LjVWMTAuNUgxMy41WiIgc3Ryb2tlPSIjRkZFNTAwIi8+CjxwYXRoIGQ9Ik00MS41IDIzLjVINTIuNVYyNy41SDQxLjVWMjMuNVoiIGZpbGw9IiNGRkZGRkYiLz4KPHBhdGggZD0iTTQxLjUgMjMuNVYyNy41SDUyLjVWMjMuNUg0MS41WiIgc3Ryb2tlPSIjRkZFNTAwIi8+CjxwYXRoIGQ9Ik00MS41IDMxLjVINTIuNVYzNS41SDQxLjVWMzEuNVoiIGZpbGw9IiNGRkZGRkYiLz4KPHBhdGggZD0iTTQxLjUgMzEuNVYzNS41SDUyLjVWMzEuNUg0MS41WiIgc3Ryb2tlPSIjRkZFNTAwIi8+Cjwvc3ZnPg==) no-repeat 1rem/1.8rem, #b32121;
+    padding: 1rem 1rem 1rem 3.7rem;
+    color: white;
+}
+
+    .blazor-error-boundary::after {
+        content: "發生錯誤";
+        color: white;
+        font-size: 1.1rem;
+    }
+
+.loading-progress {
+    position: relative;
+    display: block;
+    width: 8rem;
+    height: 8rem;
+    margin: 20vh auto 1rem auto;
+}
+
+    .loading-progress circle {
+        fill: none;
+        stroke: #e0e0e0;
+        stroke-width: 0.6rem;
+        transform-origin: 50% 50%;
+        transform: rotate(-90deg);
+    }
+
+        .loading-progress circle:last-child {
+            stroke: #1b6ec2;
+            stroke-dasharray: calc(3.141 * var(--blazor-load-percentage, 0%) * 0.8), 500%;
+            transition: stroke-dasharray 0.05s ease-in-out;
+        }
+
+.loading-progress-text {
+    position: absolute;
+    text-align: center;
+    font-weight: bold;
+    inset: calc(20vh + 3.25rem) 0 auto 0.2rem;
+}
+
+    .loading-progress-text:after {
+        content: var(--blazor-load-percentage-text, "載入中");
+    }
+
+#components-reconnect-modal {
+    background-color: rgba(0,0,0,0.8);
+    z-index: 2000;
+}
+
+#components-reconnect-modal .loading-progress {
+    position: relative;
+    left: calc(50% - 3rem);
+    top: calc(50vh - 3rem);
+}
+
+#components-reconnect-modal .loading-progress-text {
+    position: absolute;
+    top: calc(50vh + 3rem);
+    left: calc(50% - 75px);
+    color: white;
+}
+

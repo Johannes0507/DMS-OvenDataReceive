@@ -1,0 +1,70 @@
+@* NavMenu.razor - Collapsible Sidebar using Blazor + Bootstrap *@
+
+<div class="nav-menu-container @(IsCollapsed ? "collapsed" : "expanded")">
+    
+    @* 頂部標題區 *@
+    <div class="top-row ps-3 navbar navbar-dark">
+        <div class="container-fluid d-flex align-items-center">
+            @if (!IsCollapsed)
+            {
+                <a class="navbar-brand" href="">OvenDataReceive</a>
+            }
+            
+            @* 折疊按鈕 - 永遠顯示 *@
+            <button class="btn btn-link text-white ms-auto toggle-btn" 
+                    type="button" 
+                    @onclick="ToggleCollapse" 
+                    title="@(IsCollapsed ? "展開選單" : "收合選單")">
+                @if (IsCollapsed)
+                {
+                    <span class="toggle-icon">☰</span>
+                }
+                else
+                {
+                    <span class="toggle-icon">✕</span>
+                }
+            </button>
+        </div>
+    </div>
+
+    @* 導航選單 - 根據狀態顯示/隱藏 *@
+    <div class="nav-scrollable @(IsCollapsed ? "d-none" : "d-block")">
+        <nav class="nav flex-column">
+            <div class="nav-item px-3">
+                <NavLink class="nav-link" href="" Match="NavLinkMatch.All">
+                    <span class="bi bi-house-door-fill-nav-menu" aria-hidden="true"></span>
+                    <span class="nav-text">Home</span>
+                </NavLink>
+            </div>
+
+            <div class="nav-item px-3">
+                <NavLink class="nav-link" href="monitor">
+                    <span class="bi bi-speedometer2" aria-hidden="true"></span>
+                    <span class="nav-text">數據監控</span>
+                </NavLink>
+            </div>
+
+            <div class="nav-item px-3">
+                <NavLink class="nav-link" href="di-monitor">
+                    <span class="bi bi-toggles" aria-hidden="true"></span>
+                    <span class="nav-text">其他開關量</span>
+                </NavLink>
+            </div>
+        </nav>
+    </div>
+</div>
+
+@code {
+    /// <summary>
+    /// 側邊欄折疊狀態 (true = 折疊, false = 展開)
+    /// </summary>
+    private bool IsCollapsed { get; set; } = false;
+
+    /// <summary>
+    /// 切換折疊狀態
+    /// </summary>
+    private void ToggleCollapse()
+    {
+        IsCollapsed = !IsCollapsed;
+    }
+}

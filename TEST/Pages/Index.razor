@@ -1,0 +1,155 @@
+@page "/"
+@using OvenDataReceive.Services
+@inject ModbusDataService ModbusService
+@implements IDisposable
+
+<PageTitle>烤箱溫度監控系統</PageTitle>
+
+<div class="container-fluid p-4">
+    <div class="row mb-4">
+        <div class="col-12">
+            <h1 class="display-4 text-center mb-3">🔥 烤箱溫度監控系統</h1>
+            <div class="text-center mb-3">
+                @if (ModbusService.IsConnected)
+                {
+                    <span class="badge bg-success fs-6">● 已連線</span>
+                }
+                else
+                {
+                    <span class="badge bg-danger fs-6">○ 未連線</span>
+                }
+                <span class="ms-3 text-muted">
+                    @if (ModbusService.LastUpdateTime != DateTime.MinValue)
+                    {
+                        <text>最後更新: @ModbusService.LastUpdateTime.ToString("HH:mm:ss")</text>
+                    }
+                    else
+                    {
+                        <text>等待連線...</text>
+                    }
+                </span>
+            </div>
+            
+            @if (!ModbusService.IsConnected)
+            {
+                <div class="alert alert-warning" role="alert">
+                    <strong>⚠️ 設備未連線</strong>
+                    <p class="mb-0 mt-2">
+                        無法連接到 Modbus 設備。請檢查：
+                        <ul class="mb-0">
+                            <li>設備是否已開啟並連接到網路</li>
+                            <li>IP 位址 (192.168.61.144) 是否正確</li>
+                            <li>Port (4196) 是否正確</li>
+                        </ul>
+                    </p>
+                    @if (!string.IsNullOrEmpty(ModbusService.ErrorMessage))
+                    {
+                        <hr />
+                        <small class="text-muted">錯誤詳情: @ModbusService.ErrorMessage</small>
+                    }
+                </div>
+            }
+        </div>
+    </div>
+
+    @if (ModbusService.IsConnected)
+    {
+        <div class="row mb-4">
+            <div class="col-12">
+                <h3 class="mb-3">📊 開關量狀態 (DI)</h3>
+                <div class="row g-2">
+                    @if (ModbusService.DiStatus.Count > 0)
+                    {
+                        @for (int i = 0; i < ModbusService.DiStatus.Count; i++)
+                        {
+                            var index = i;
+                            <div class="col-md-3 col-sm-4 col-6">
+                                <div class="card @(ModbusService.DiStatus[index] ? "border-success bg-success bg-opacity-10" : "border-secondary")">
+                                    <div class="card-body text-center p-2">
+                                        <div class="fs-4 @(ModbusService.DiStatus[index] ? "text-success" : "text-secondary")">
+                                            @(ModbusService.DiStatus[index] ? "●" : "○")
+                                        </div>
+                                        <div class="small">DI@((index + 1).ToString("D2"))</div>
+                                    </div>
+                                </div>
+                            </div>
+                        }
+                    }
+                    else
+                    {
+                        <div class="col-12">
+                            <div class="alert alert-info">等待 DI 數據...</div>
+                        </div>
+                    }
+                </div>
+            </div>
+        </div>
+
+        <div class="row">
+            <div class="col-12">
+                <h3 class="mb-3">🌡️ 溫度監控</h3>
+                <div class="row g-3">
+                    @if (ModbusService.Temperatures.Count > 0)
+                    {
+                        @for (int i = 0; i < ModbusService.Temperatures.Count; i++)
+                        {
+                            var index = i;
+                            var temp = ModbusService.Temperatures[index];
+                            var tempClass = temp switch
+                            {
+                                >= 200 => "danger",
+                                >= 150 => "warning",
+                                >= 100 => "info",
+                                _ => "primary"
+                            };
+                            
+                            <div class="col-lg-3 col-md-4 col-sm-6">
+                                <div class="card border-@tempClass shadow-sm">
+                                    <div class="card-body text-center">
+                                        <div class="display-6 fw-bold text-@tempClass">
+                                            @temp.ToString("F1")°C
+                                        </div>
+                                        <div class="text-muted mt-2">溫度感應器 @(index + 1)</div>
+                                    </div>
+                                </div>
+                            </div>
+                        }
+                    }
+                    else
+                    {
+                        <div class="col-12">
+                            <div class="alert alert-info">等待溫度數據...</div>
+                        </div>
+                    }
+                </div>
+            </div>
+        </div>
+    }
+</div>
+
+@code {
+    private System.Threading.Timer? _timer;
+
+    protected override void OnInitialized()
+    {
+        // 訂閱數據更新事件
+        ModbusService.DataUpdated += OnDataUpdated;
+        
+        // 設定定時器，每秒更新一次 UI（確保顯示連線狀態變化）
+        _timer = new System.Threading.Timer(async _ =>
+        {
+            await InvokeAsync(StateHasChanged);
+        }, null, 0, 1000);
+    }
+
+    private void OnDataUpdated()
+    {
+        InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose()
+    {
+        ModbusService.DataUpdated -= OnDataUpdated;
+        _timer?.Dispose();
+    }
+}
