@@ -12,6 +12,7 @@ builder.Services.AddSingleton<ModbusDataService>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<ModbusDataService>());
 
 var app = builder.Build();
+app.Run("http://0.0.0.0:5133");
 
 // Configure the HTTP request pipeline.
 if (!app.Environment.IsDevelopment())
@@ -22,7 +23,6 @@ if (!app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
-
 
 app.UseAntiforgery();
 
