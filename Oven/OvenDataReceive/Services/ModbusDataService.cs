@@ -2,6 +2,7 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Collections.Concurrent;
+using System.Globalization;
 using FluentModbus;
 
 namespace OvenDataReceive.Services
@@ -22,6 +23,17 @@ namespace OvenDataReceive.Services
         private readonly int _tempRegisterStride;  // 溫度寄存器步進（每一感測器偏移）
         private readonly int _readIntervalMs;      // 讀取週期（毫秒）
         private readonly int _sensorTimeoutMs;     // 單一感測器超時（毫秒）
+        private readonly double _tempScale;        // 溫度縮放比例（Raw * Scale）
+        private readonly bool _tempUseSigned;      // 是否以 signed 解析 Raw
+        private readonly bool _tempSwapBytes;      // 是否交換高低位元組
+        private readonly bool _tempBulkRead;       // 是否優先使用批次讀取
+        private readonly bool _registerScanEnabled;
+        private readonly int _registerScanStart;
+        private readonly int _registerScanCount;
+        private readonly string _registerScanPath;
+        private bool _registerScanExecuted;
+        private readonly List<int> _tempRegisterAddrCandidates;
+        private int _effectiveRegisterAddr;  // 生效中的基底地址，-1 表示未定
 
         // 數據模型
         private readonly object _dataLock = new object();
@@ -39,6 +51,14 @@ namespace OvenDataReceive.Services
         private readonly object _rawLogLock = new object();
         private readonly Queue<string> _rawLogBuffer = new Queue<string>();
         private readonly string _rawLogPath;
+        private const int DiLogMaxEntries = 200;
+        private readonly object _diLogLock = new object();
+        private readonly Queue<string> _diLogBuffer = new Queue<string>();
+        private readonly string _diLogPath;
+        private const int ErrorLogMaxEntries = 200;
+        private readonly object _errorLogLock = new object();
+        private readonly Queue<string> _errorLogBuffer = new Queue<string>();
+        private readonly string _errorLogPath;
         private readonly ConcurrentDictionary<int, bool> _diStatusCache = new();
         private readonly ConcurrentDictionary<int, double> _temperatureCache = new();
         private readonly ConcurrentDictionary<int, string?> _temperatureErrorCache = new();
@@ -81,7 +101,60 @@ namespace OvenDataReceive.Services
             private set { lock (_dataLock) _errorMessage = value; }
         }
 
+        public record DiReadResult(List<bool> Status, string? ErrorMessage, DateTime Timestamp);
+
+        /// <summary>
+        /// SHZK-DI 設備資訊 (PDF 第 4.7 節 通訊參數寄存器表)
+        /// 寄存器地址 2000-2002、2010-2011 (FC03 讀取)
+        /// </summary>
+        public record DeviceInfo(
+            int DeviceAddress,
+            int Rs232BaudCode,
+            int Rs485BaudCode,
+            int ActiveUploadFlag,
+            int ActiveUploadTimeUnit,
+            string? ErrorMessage,
+            DateTime Timestamp)
+        {
+            // PDF 表格：波特率代碼對照
+            private static readonly string[] BaudRateLabels = new[]
+            {
+                "9600", "1200", "2400", "4800", "9600", "19200", "38400", "57600", "115200"
+            };
+
+            public string Rs232BaudLabel => BaudCode(Rs232BaudCode);
+            public string Rs485BaudLabel => BaudCode(Rs485BaudCode);
+
+            public string ActiveUploadDescription => ActiveUploadFlag switch
+            {
+                1 => "繼電器狀態主動回傳",
+                2 => "開關量輸入狀態主動回傳",
+                3 => "繼電器+開關量都回傳",
+                _ => "關閉"
+            };
+
+            public string ActiveUploadTimeDescription
+                => ActiveUploadTimeUnit == 0 ? "未設定" : $"{ActiveUploadTimeUnit * 0.1:F1} 秒";
+
+            private static string BaudCode(int code)
+                => code >= 0 && code < BaudRateLabels.Length ? BaudRateLabels[code] : $"未知({code})";
+        }
+
+        public List<string> ErrorLogs
+        {
+            get
+            {
+                lock (_errorLogLock)
+                {
+                    return _errorLogBuffer.ToList();
+                }
+            }
+        }
+
         // 溫度感測器資訊對應表（站號 1-12）
+        // ★ 硬體接線注意事項：
+        // 現場採用 RS485 串聯（Daisy Chain），其中站號 2、3（藥水箱）為線路前段關鍵節點。
+        // 如果這兩個站點斷電或斷線，會導致後續串聯的站點也無法通訊。
         public static readonly Dictionary<int, SensorInfo> TempSensors = new()
         {
             // 高速加熱定型機
@@ -126,18 +199,30 @@ namespace OvenDataReceive.Services
             _configuration = configuration;
             
             // 從配置文件讀取設置
-            _ipAddress = _configuration["Modbus:IpAddress"] ?? "192.168.61.144";
+            _ipAddress = _configuration["Modbus:IpAddress"] ?? "192.168.61.74";
             _port = int.Parse(_configuration["Modbus:Port"] ?? "4196");
             _diUnitId = byte.Parse(_configuration["Modbus:DiUnitId"] ?? "255");
             _tempSensorCount = int.Parse(_configuration["Modbus:TempSensorCount"] ?? "12");
             _tempUnitId = byte.Parse(_configuration["Modbus:TempUnitId"] ?? "1");
             _tempRegisterAddr = int.Parse(_configuration["Modbus:TempRegisterAddr"] ?? "0");
             _tempRegisterStride = int.Parse(_configuration["Modbus:TempRegisterStride"] ?? "1");
+            _tempScale = ReadTempScale(_configuration["Modbus:TempScale"]);
+            _tempUseSigned = ReadBoolSetting(_configuration["Modbus:TempUseSigned"], true);
+            _tempSwapBytes = ReadBoolSetting(_configuration["Modbus:TempSwapBytes"], false);
+            _tempBulkRead = ReadBoolSetting(_configuration["Modbus:TempBulkRead"], true);
+            _registerScanEnabled = ReadBoolSetting(_configuration["Modbus:RegisterScanEnabled"], false);
+            _registerScanStart = Math.Max(0, int.Parse(_configuration["Modbus:RegisterScanStart"] ?? "0"));
+            _registerScanCount = Math.Clamp(int.Parse(_configuration["Modbus:RegisterScanCount"] ?? "64"), 1, 128);
+            _tempRegisterAddrCandidates = ParseRegisterAddrCandidates(_configuration["Modbus:TempRegisterAddrCandidates"]);
+            _effectiveRegisterAddr = -1;
 
             var logsDir = Path.Combine(Directory.GetCurrentDirectory(), "Logs");
             Directory.CreateDirectory(logsDir);
+            _registerScanPath = Path.Combine(logsDir, "RegisterScan.txt");
             _tempLogPath = Path.Combine(logsDir, "TemperatureRecording.txt");
             _rawLogPath = Path.Combine(logsDir, "RawData.txt");
+            _diLogPath = Path.Combine(logsDir, "DiDiagnostic.txt");
+            _errorLogPath = Path.Combine(logsDir, "Error.txt");
             if (File.Exists(_tempLogPath))
             {
                 var existingLines = File.ReadAllLines(_tempLogPath);
@@ -161,6 +246,30 @@ namespace OvenDataReceive.Services
             else
             {
                 File.WriteAllText(_rawLogPath, string.Empty);
+            }
+            if (File.Exists(_diLogPath))
+            {
+                var existingLines = File.ReadAllLines(_diLogPath);
+                foreach (var line in existingLines.TakeLast(DiLogMaxEntries))
+                {
+                    _diLogBuffer.Enqueue(line);
+                }
+            }
+            else
+            {
+                File.WriteAllText(_diLogPath, string.Empty);
+            }
+            if (File.Exists(_errorLogPath))
+            {
+                var existingLines = File.ReadAllLines(_errorLogPath);
+                foreach (var line in existingLines.TakeLast(ErrorLogMaxEntries))
+                {
+                    _errorLogBuffer.Enqueue(line);
+                }
+            }
+            else
+            {
+                File.WriteAllText(_errorLogPath, string.Empty);
             }
             
             // 讀取週期：預設 2000ms (2秒)
@@ -190,6 +299,13 @@ namespace OvenDataReceive.Services
             _logger.LogInformation($"  溫度感測器: {_tempSensorCount} 個");
             _logger.LogInformation($"  溫度裝置 UnitID: {_tempUnitId}");
             _logger.LogInformation($"  溫度寄存器: 基底地址={_tempRegisterAddr}, 步進={_tempRegisterStride}");
+            if (_tempRegisterAddrCandidates.Count > 0)
+                _logger.LogInformation($"  暫存器候選: {string.Join(", ", _tempRegisterAddrCandidates)}");
+            _logger.LogInformation($"  溫度縮放比例: {_tempScale} (Raw * Scale)");
+            _logger.LogInformation($"  溫度原始值解析: {(_tempUseSigned ? "signed" : "unsigned")}");
+            _logger.LogInformation($"  交換高低位元組: {(_tempSwapBytes ? "是" : "否")}");
+            _logger.LogInformation($"  溫度讀取模式: {(_tempBulkRead ? "批次" : "逐筆")}");
+            _logger.LogInformation($"  暫存器掃描診斷: {(_registerScanEnabled ? $"開啟 (起點={_registerScanStart}, 數量={_registerScanCount})" : "關閉")}");
             _logger.LogInformation($"  讀取週期: {_readIntervalMs}ms");
             _logger.LogInformation($"  感測器超時: {_sensorTimeoutMs}ms");
             _logger.LogInformation("========================================");
@@ -211,6 +327,13 @@ namespace OvenDataReceive.Services
                         continue;
                     }
 
+                    // Step 1.5: 暫存器掃描診斷（僅執行一次）
+                    if (_registerScanEnabled && !_registerScanExecuted)
+                    {
+                        RunRegisterScan();
+                        _registerScanExecuted = true;
+                    }
+
                     // Step 2: 讀取 DI 狀態
                     var diResult = ReadDiStatus();
                     
@@ -225,7 +348,8 @@ namespace OvenDataReceive.Services
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError($"❌ 執行異常: {ex.Message}");
+                    SafeLogError($"❌ 執行異常: {ex.Message}");
+                    AppendErrorLog($"執行異常: {ex.Message}");
                     IsConnected = false;
                     ErrorMessage = ex.Message;
                     DisconnectClient();
@@ -262,11 +386,68 @@ namespace OvenDataReceive.Services
             }
             catch (Exception ex)
             {
-                _logger.LogError($"❌ 連線失敗: {ex.Message}");
+                SafeLogError($"❌ 連線失敗: {ex.Message}");
+                AppendErrorLog($"連線失敗: {ex.Message}");
                 DisconnectClient();
             }
             
             return false;
+        }
+
+        /// <summary>
+        /// 暫存器掃描診斷：掃描 Holding 與 Input 暫存器範圍，輸出 Raw 值至 Logs/RegisterScan.txt
+        /// </summary>
+        private void RunRegisterScan()
+        {
+            if (_client == null || !_client.IsConnected)
+                return;
+
+            var lines = new List<string>
+            {
+                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] 暫存器掃描診斷 (UnitID={_tempUnitId}, 起點={_registerScanStart}, 數量={_registerScanCount})",
+                ""
+            };
+
+            ushort[] holdingValues = Array.Empty<ushort>();
+            ushort[] inputValues = Array.Empty<ushort>();
+
+            try
+            {
+                holdingValues = _client.ReadHoldingRegisters<ushort>(_tempUnitId, _registerScanStart, _registerScanCount).ToArray();
+            }
+            catch (Exception ex)
+            {
+                lines.Add($"Holding 讀取失敗: {ex.Message}");
+            }
+
+            try
+            {
+                inputValues = _client.ReadInputRegisters<ushort>(_tempUnitId, _registerScanStart, _registerScanCount).ToArray();
+            }
+            catch (Exception ex)
+            {
+                lines.Add($"Input 讀取失敗: {ex.Message}");
+            }
+
+            int maxLen = Math.Max(holdingValues.Length, inputValues.Length);
+            for (int i = 0; i < maxLen; i++)
+            {
+                int holdingAddr = 40001 + _registerScanStart + i;
+                int inputAddr = 30001 + _registerScanStart + i;
+                ushort h = i < holdingValues.Length ? holdingValues[i] : (ushort)0;
+                ushort inp = i < inputValues.Length ? inputValues[i] : (ushort)0;
+                lines.Add($"[{holdingAddr}] Holding: 0x{h:X4} ({h}) | Input: 0x{inp:X4} ({inp})");
+            }
+
+            try
+            {
+                File.WriteAllLines(_registerScanPath, lines);
+                _logger.LogInformation($"✅ 暫存器掃描完成，結果已寫入 {_registerScanPath}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"暫存器掃描結果寫入失敗: {ex.Message}");
+            }
         }
 
         /// <summary>
@@ -313,9 +494,86 @@ namespace OvenDataReceive.Services
             catch (Exception ex)
             {
                 _logger.LogWarning($"⚠️ DI 讀取失敗: {ex.Message}");
+                AppendErrorLog($"DI 讀取失敗: {ex.Message}");
             }
 
             return result;
+        }
+
+        public Task<DiReadResult> ReadDiStatusDirectAsync(int startAddress, int count)
+        {
+            var timestamp = DateTime.Now;
+            var result = new List<bool>();
+            int safeCount = Math.Clamp(count, 1, 64);
+            for (int i = 0; i < safeCount; i++)
+                result.Add(false);
+
+            try
+            {
+                using var client = new ModbusTcpClient();
+                client.ReadTimeout = _sensorTimeoutMs;
+                client.Connect(new IPEndPoint(IPAddress.Parse(_ipAddress), _port));
+                if (!client.IsConnected)
+                {
+                    AppendDiDiagnosticLog("Direct", result, "連線失敗", timestamp);
+                    return Task.FromResult(new DiReadResult(result, "連線失敗", timestamp));
+                }
+
+                var diData = client.ReadDiscreteInputs(_diUnitId, startAddress, safeCount);
+                var bytes = diData.ToArray();
+                result.Clear();
+                foreach (var b in bytes)
+                {
+                    for (int i = 0; i < 8; i++)
+                    {
+                        result.Add((b & (1 << i)) != 0);
+                    }
+                }
+
+                if (result.Count > safeCount)
+                    result = result.Take(safeCount).ToList();
+
+                AppendDiDiagnosticLog("Direct", result, null, timestamp);
+                return Task.FromResult(new DiReadResult(result, null, timestamp));
+            }
+            catch (Exception ex)
+            {
+                AppendDiDiagnosticLog("Direct", result, ex.Message, timestamp);
+                return Task.FromResult(new DiReadResult(result, ex.Message, timestamp));
+            }
+        }
+
+        /// <summary>
+        /// 讀取 SHZK-DI 設備資訊 (PDF 4.7 節) - FC03 寄存器 2000~2011
+        /// </summary>
+        public Task<DeviceInfo> ReadDeviceInfoAsync()
+        {
+            var timestamp = DateTime.Now;
+            try
+            {
+                using var client = new ModbusTcpClient();
+                client.ReadTimeout = _sensorTimeoutMs;
+                client.Connect(new IPEndPoint(IPAddress.Parse(_ipAddress), _port));
+                if (!client.IsConnected)
+                    return Task.FromResult(new DeviceInfo(0, 0, 0, 0, 0, "連線失敗", timestamp));
+
+                // 寄存器 2000~2002: 裝置地址、RS232/RS485 鮑率代碼
+                var regs2000 = client.ReadHoldingRegisters<short>(_diUnitId, 2000, 3).ToArray();
+                int devAddr   = regs2000[0];
+                int rs232Baud = regs2000[1];
+                int rs485Baud = regs2000[2];
+
+                // 寄存器 2010~2011: 主動上傳旗標 & 時間單位
+                var regs2010 = client.ReadHoldingRegisters<short>(_diUnitId, 2010, 2).ToArray();
+                int uploadFlag = regs2010[0];
+                int uploadTime = regs2010[1];
+
+                return Task.FromResult(new DeviceInfo(devAddr, rs232Baud, rs485Baud, uploadFlag, uploadTime, null, timestamp));
+            }
+            catch (Exception ex)
+            {
+                return Task.FromResult(new DeviceInfo(0, 0, 0, 0, 0, ex.Message, timestamp));
+            }
         }
 
         /// <summary>
@@ -323,6 +581,20 @@ namespace OvenDataReceive.Services
         /// </summary>
         private async Task<(List<double> Temperatures, List<string?> Errors)> ReadTemperaturesAsync(CancellationToken stoppingToken)
         {
+            if (_tempBulkRead)
+            {
+                var bulkResult = ReadTemperatureBlockWithTimeout();
+                if (bulkResult.Success)
+                {
+                    await Task.Delay(1200, stoppingToken);
+                    _logger.LogInformation($"✅ 溫度批次讀取: {bulkResult.Temperatures.Count}/{_tempSensorCount} 成功");
+                    return (bulkResult.Temperatures, bulkResult.Errors);
+                }
+
+                _logger.LogWarning($"⚠️ 溫度批次讀取失敗，改用逐筆讀取: {bulkResult.ErrorMessage}");
+                AppendErrorLog($"溫度批次讀取失敗: {bulkResult.ErrorMessage}");
+            }
+
             var result = new List<double>();
             var errors = new List<string?>();
             int successCount = 0;
@@ -349,6 +621,7 @@ namespace OvenDataReceive.Services
                 {
                     _logger.LogWarning($"  #{sensorId} {GetSensorName(sensorId)} 讀取失敗: {readResult.ErrorMessage}");
                     AppendTemperatureErrorLog(readResult.ErrorMessage, sensorId);
+                    AppendErrorLog($"溫度讀取失敗 DI{sensorId:D2}: {readResult.ErrorMessage}");
                 }
 
                 // 讀取間隔，避免 TCP 封包黏滯
@@ -371,6 +644,140 @@ namespace OvenDataReceive.Services
             return (result, errors);
         }
 
+        private (List<double> Temperatures, List<string?> Errors, bool Success, string? ErrorMessage) ReadTemperatureBlockWithTimeout()
+        {
+            var result = new List<double>(_tempSensorCount);
+            var errors = new List<string?>(_tempSensorCount);
+
+            if (_client == null || !_client.IsConnected)
+            {
+                if (!EnsureConnected())
+                {
+                    for (int i = 0; i < _tempSensorCount; i++)
+                        errors.Add("連線失敗");
+                    return (result, errors, false, "連線失敗");
+                }
+            }
+
+            var addressesToTry = GetAddressesToTry().ToList();
+            foreach (var addr in addressesToTry)
+            {
+                var (temps, errs, ok, errMsg) = TryReadTemperatureBlockAt(addr);
+                if (!ok)
+                    continue;
+                if (temps.Any(t => t != 0))
+                {
+                    if (_effectiveRegisterAddr != addr)
+                    {
+                        _effectiveRegisterAddr = addr;
+                        _logger.LogInformation($"✅ 溫度暫存器候選生效: 基底地址 {addr}");
+                    }
+                    return (temps, errs, true, null);
+                }
+            }
+            var fallbackAddr = addressesToTry.Count > 0 ? addressesToTry[0] : _tempRegisterAddr;
+            var (ft, fe, fok, ferr) = TryReadTemperatureBlockAt(fallbackAddr);
+            if (fok && _effectiveRegisterAddr < 0)
+                _effectiveRegisterAddr = fallbackAddr;
+            return (ft, fe, fok, ferr);
+        }
+
+        private IEnumerable<int> GetAddressesToTry()
+        {
+            if (_effectiveRegisterAddr >= 0)
+                return new[] { _effectiveRegisterAddr };
+            if (_tempRegisterAddrCandidates.Count > 0)
+                return _tempRegisterAddrCandidates;
+            return new[] { _tempRegisterAddr };
+        }
+
+        private (List<double> Temperatures, List<string?> Errors, bool Success, string? ErrorMessage) TryReadTemperatureBlockAt(int address)
+        {
+            var result = new List<double>(_tempSensorCount);
+            var errors = new List<string?>(_tempSensorCount);
+
+            try
+            {
+                var (useInput, offset) = ResolveRegisterAddress(address);
+                int stride = Math.Max(1, _tempRegisterStride);
+                int registerCount = _tempSensorCount * stride;
+
+                var readTask = Task.Run(() =>
+                {
+                    try
+                    {
+                        if (useInput)
+                        {
+                            var data = _client!.ReadInputRegisters<ushort>(_tempUnitId, offset, registerCount);
+                            return (data.ToArray(), (string?)null);
+                        }
+                        try
+                        {
+                            var data = _client!.ReadHoldingRegisters<ushort>(_tempUnitId, offset, registerCount);
+                            return (data.ToArray(), (string?)null);
+                        }
+                        catch (Exception ex1)
+                        {
+                            try
+                            {
+                                var data = _client!.ReadInputRegisters<ushort>(_tempUnitId, offset, registerCount);
+                                return (data.ToArray(), (string?)null);
+                            }
+                            catch (Exception ex2)
+                            {
+                                return (Array.Empty<ushort>(), $"HR:{ex1.Message} / IR:{ex2.Message}");
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        return (Array.Empty<ushort>(), ex.Message);
+                    }
+                });
+
+                if (!readTask.Wait(_sensorTimeoutMs))
+                {
+                    for (int i = 0; i < _tempSensorCount; i++)
+                        errors.Add($"讀取超時({_sensorTimeoutMs}ms)");
+                    return (result, errors, false, $"讀取超時({_sensorTimeoutMs}ms)");
+                }
+
+                var (rawValues, error) = readTask.Result;
+                if (error != null)
+                {
+                    for (int i = 0; i < _tempSensorCount; i++)
+                        errors.Add(error);
+                    return (result, errors, false, error);
+                }
+
+                int strideValue = Math.Max(1, _tempRegisterStride);
+                for (int i = 0; i < _tempSensorCount; i++)
+                {
+                    int rawIndex = i * strideValue;
+                    int sensorId = i + 1;
+                    if (rawIndex >= rawValues.Length)
+                    {
+                        result.Add(0);
+                        errors.Add("資料不足");
+                        continue;
+                    }
+
+                    var raw = rawValues[rawIndex];
+                    AppendRawLog(raw, sensorId);
+                    result.Add(ConvertRawTemperature(raw, sensorId));
+                    errors.Add(null);
+                }
+
+                return (result, errors, true, null);
+            }
+            catch (Exception ex)
+            {
+                for (int i = 0; i < _tempSensorCount; i++)
+                    errors.Add($"讀取異常: {ex.Message}");
+                return (result, errors, false, $"讀取異常: {ex.Message}");
+            }
+        }
+
         /// <summary>
         /// 讀取單一感測器溫度（帶超時保護，不會卡住）
         /// </summary>
@@ -387,31 +794,29 @@ namespace OvenDataReceive.Services
                 // 使用 Task 包裝，確保超時能生效
                 var readTask = Task.Run(() =>
                 {
-                    // 閘道器映射架構：
-                    // - 所有 CM1 溫度表映射到同一個 UnitID
-                    // - 不同感測器對應不同的寄存器地址
-                    // - 地址 = 基底地址 + (感測器序號 - 1) * 步進
-                    int registerAddr = _tempRegisterAddr + ((sensorId - 1) * _tempRegisterStride);
+                    int baseAddr = _effectiveRegisterAddr >= 0 ? _effectiveRegisterAddr : _tempRegisterAddr;
+                    var (useInput, baseOffset) = ResolveRegisterAddress(baseAddr);
+                    int registerAddr = baseOffset + ((sensorId - 1) * _tempRegisterStride);
                     bool hadException = false;
 
                     try
                     {
-                        // 嘗試讀取 Holding Register (功能碼 03)
-                        var data = _client!.ReadHoldingRegisters<ushort>(_tempUnitId, registerAddr, 1);
-                        var raw = data.ToArray()[0];
-                        AppendRawLog(raw, sensorId);
-                        return (ConvertRawTemperature(raw, sensorId), (string?)null);
+                        var regData = useInput
+                            ? _client!.ReadInputRegisters<ushort>(_tempUnitId, registerAddr, 1)
+                            : _client!.ReadHoldingRegisters<ushort>(_tempUnitId, registerAddr, 1);
+                        var regRaw = regData.ToArray()[0];
+                        AppendRawLog(regRaw, sensorId);
+                        return (ConvertRawTemperature(regRaw, sensorId), (string?)null);
                     }
                     catch (Exception ex1)
                     {
                         hadException = true;
-                        // 嘗試 Input Register (功能碼 04)
                         try
                         {
-                            var data = _client!.ReadInputRegisters<ushort>(_tempUnitId, registerAddr, 1);
-                            var raw = data.ToArray()[0];
-                            AppendRawLog(raw, sensorId);
-                            return (ConvertRawTemperature(raw, sensorId), (string?)null);
+                            var regData = _client!.ReadInputRegisters<ushort>(_tempUnitId, registerAddr, 1);
+                            var regRaw = regData.ToArray()[0];
+                            AppendRawLog(regRaw, sensorId);
+                            return (ConvertRawTemperature(regRaw, sensorId), (string?)null);
                         }
                         catch (Exception ex2)
                         {
@@ -440,12 +845,14 @@ namespace OvenDataReceive.Services
                 else
                 {
                     _logger.LogDebug($"{GetSensorName(sensorId)} 讀取超時 ({_sensorTimeoutMs}ms)");
+                    AppendErrorLog($"溫度讀取超時 DI{sensorId:D2}: {_sensorTimeoutMs}ms");
                     return new TemperatureReadResult(0, $"讀取超時({_sensorTimeoutMs}ms)");
                 }
             }
             catch (Exception ex)
             {
                 _logger.LogDebug($"{GetSensorName(sensorId)} 讀取異常: {ex.Message}");
+                AppendErrorLog($"溫度讀取異常 DI{sensorId:D2}: {ex.Message}");
                 DisconnectClient();
                 return new TemperatureReadResult(0, $"讀取異常: {ex.Message}");
             }
@@ -499,44 +906,50 @@ namespace OvenDataReceive.Services
             finally
             {
                 _client = null;
+                _effectiveRegisterAddr = -1;
             }
         }
 
         /// <summary>
         /// 將原始 16-bit 整數轉換為實際溫度
         /// ADTEK CM1 系列數位溫度表：
-        /// - 設備直接回傳溫度值 * 10（例如 1525 = 152.5°C）
-        /// - 公式: 實際溫度 = RawValue / 10.0
+        /// - 設備回傳溫度原始值，可依需求設定縮放比例
+        /// - 公式: 實際溫度 = RawValue * Scale
         /// - 有效範圍: -1999 ~ 9999（對應 -199.9°C ~ 999.9°C）
         /// - 若 RawValue < -1999，代表感測器異常
         /// </summary>
         private double ConvertRawTemperature(ushort rawUnsigned, int sensorId)
         {
-            // 將 unsigned 轉換為 signed（因為溫度可為負值）
-            short raw = unchecked((short)rawUnsigned);
+            ushort normalizedRaw = _tempSwapBytes
+                ? (ushort)((rawUnsigned >> 8) | (rawUnsigned << 8))
+                : rawUnsigned;
+
+            int rawValue = _tempUseSigned
+                ? unchecked((short)normalizedRaw)
+                : normalizedRaw;
             
             // 錯誤處理：若 RawValue < -1999，代表感測器異常
-            if (raw < -1999)
+            if (_tempUseSigned && rawValue < -1999)
             {
-                _logger.LogWarning($"[TempDebug] DI{sensorId:D2} Raw: {raw} (unsigned: {rawUnsigned}) → 感測器異常，設為 0");
-                AppendTemperatureLog(raw, 0, sensorId);
+                _logger.LogWarning($"[TempDebug] DI{sensorId:D2} Raw: {rawValue} (unsigned: {rawUnsigned}) → 感測器異常，設為 0");
+                AppendTemperatureLog(rawValue, 0, sensorId);
                 return 0;
             }
             
-            // ADTEK CM1 換算公式：實際溫度 = RawValue / 10.0
-            double temperature = raw / 10.0;
+            // 依設定縮放比例換算溫度
+            double temperature = rawValue * _tempScale;
             
-            _logger.LogInformation($"[TempDebug] DI{sensorId:D2} Raw: {raw}, Calculated: {temperature:F1}°C");
-            AppendTemperatureLog(raw, temperature, sensorId);
+            _logger.LogInformation($"[TempDebug] DI{sensorId:D2} Raw: {rawValue}, Calculated: {temperature:F1}°C");
+            AppendTemperatureLog(rawValue, temperature, sensorId);
             
             // 四捨五入到小數點後 1 位
             return Math.Round(temperature, 1);
         }
 
-        private void AppendTemperatureLog(short raw, double temperature, int sensorId)
+        private void AppendTemperatureLog(int rawValue, double temperature, int sensorId)
         {
             var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-            var logLine = $"[{timestamp}] [TempDebug] DI{sensorId:D2} Raw: {raw}, Calculated: {temperature:F1}°C";
+            var logLine = $"[{timestamp}] [TempDebug] DI{sensorId:D2} Raw: {rawValue}, Calculated: {temperature:F1}°C";
             try
             {
                 lock (_tempLogLock)
@@ -552,6 +965,69 @@ namespace OvenDataReceive.Services
             catch (Exception ex)
             {
                 _logger.LogDebug($"溫度記錄寫入失敗: {ex.Message}");
+            }
+        }
+
+        private static double ReadTempScale(string? value)
+        {
+            if (double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var scale) && scale > 0)
+            {
+                return scale;
+            }
+            return 0.1;
+        }
+
+        private static bool ReadBoolSetting(string? value, bool defaultValue)
+        {
+            return bool.TryParse(value, out var parsed) ? parsed : defaultValue;
+        }
+
+        private static int NormalizeHoldingRegisterAddress(int address)
+        {
+            if (address >= 40001)
+            {
+                return address - 40001;
+            }
+            return address;
+        }
+
+        /// <summary>
+        /// 解析暫存器候選地址字串，例如 "40001,40002,0,30001"
+        /// </summary>
+        private static List<int> ParseRegisterAddrCandidates(string? value)
+        {
+            var list = new List<int>();
+            if (string.IsNullOrWhiteSpace(value))
+                return list;
+            foreach (var part in value.Split(',', StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (int.TryParse(part.Trim(), out var addr))
+                    list.Add(addr);
+            }
+            return list;
+        }
+
+        /// <summary>
+        /// 解析 Modbus 地址為 (是否用 Input Register, 0-based 偏移)
+        /// </summary>
+        private static (bool UseInput, int Offset) ResolveRegisterAddress(int address)
+        {
+            if (address >= 30001 && address < 40001)
+                return (true, address - 30001);
+            if (address >= 40001)
+                return (false, address - 40001);
+            return (false, address);
+        }
+
+        private void SafeLogError(string message)
+        {
+            try
+            {
+                _logger.LogError(message);
+            }
+            catch
+            {
+                // Ignore logging failures to avoid crashing background service.
             }
         }
 
@@ -600,6 +1076,58 @@ namespace OvenDataReceive.Services
             catch (Exception ex)
             {
                 _logger.LogDebug($"Raw 記錄寫入失敗: {ex.Message}");
+            }
+        }
+
+        private void AppendDiDiagnosticLog(string source, List<bool> statuses, string? errorMessage, DateTime timestamp)
+        {
+            var active = statuses
+                .Select((value, index) => new { value, index })
+                .Where(x => x.value)
+                .Select(x => $"DI{x.index + 1:D2}")
+                .ToList();
+            var statusSummary = active.Count > 0 ? string.Join(", ", active) : "無啟動";
+            var logLine = $"[{timestamp:yyyy-MM-dd HH:mm:ss}] [DiDiag:{source}] {(string.IsNullOrWhiteSpace(errorMessage) ? $"Active: {statusSummary}" : $"Error: {errorMessage}")}";
+            try
+            {
+                lock (_diLogLock)
+                {
+                    _diLogBuffer.Enqueue(logLine);
+                    while (_diLogBuffer.Count > DiLogMaxEntries)
+                    {
+                        _diLogBuffer.Dequeue();
+                    }
+                    File.WriteAllLines(_diLogPath, _diLogBuffer);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug($"DI 記錄寫入失敗: {ex.Message}");
+            }
+        }
+
+        private void AppendErrorLog(string message)
+        {
+            if (string.IsNullOrWhiteSpace(message))
+                return;
+
+            var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+            var logLine = $"[{timestamp}] [Error] {message}";
+            try
+            {
+                lock (_errorLogLock)
+                {
+                    _errorLogBuffer.Enqueue(logLine);
+                    while (_errorLogBuffer.Count > ErrorLogMaxEntries)
+                    {
+                        _errorLogBuffer.Dequeue();
+                    }
+                    File.WriteAllLines(_errorLogPath, _errorLogBuffer);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug($"Error 記錄寫入失敗: {ex.Message}");
             }
         }
 

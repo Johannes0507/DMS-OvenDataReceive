@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ping:*)",
+      "Bash(netstat:*)",
+      "Bash(findstr:*)",
+      "Bash(timeout /t 8 /nobreak)",
+      "Bash(curl:*)",
+      "Bash(dotnet run:*)",
+      "Bash(ipconfig:*)",
+      "Bash(powershell:*)",
+      "Bash(python:*)",
+      "Bash(taskkill:*)"
+    ]
+  }
+}

@@ -1,0 +1,437 @@
+@page "/di-compare"
+@rendermode InteractiveServer
+@inject ModbusDataService ModbusService
+@implements IDisposable
+
+<PageTitle>DI 診斷面板</PageTitle>
+
+<div class="monitor-container">
+
+    @* ── 標題列 ──*@
+    <div class="header-section">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+            <h1 class="page-title">
+                <span class="icon-oven">🔎</span> DI 診斷面板
+                <small class="text-muted fw-normal fs-6 ms-2">SHZK-DI 開關量採集模組</small>
+            </h1>
+            <div>
+                @if (ModbusService.IsConnected)
+                {
+                    <span class="badge bg-success px-3 py-2 rounded-pill">● 已連線</span>
+                }
+                else
+                {
+                    <span class="badge bg-danger px-3 py-2 rounded-pill">● 未連線</span>
+                }
+            </div>
+        </div>
+
+        <div class="info-bar">
+            <div class="info-item"><span class="info-label">協議:</span><span class="info-value">Modbus TCP / FC02</span></div>
+            <div class="info-item"><span class="info-label">直連讀取時間:</span><span class="info-value">@(_directResult?.Timestamp.ToString("HH:mm:ss") ?? "—")</span></div>
+            <div class="info-item"><span class="info-label">設備資訊時間:</span><span class="info-value">@(_deviceInfo?.Timestamp.ToString("HH:mm:ss") ?? "—")</span></div>
+        </div>
+
+        <div class="mt-3 d-flex gap-2 flex-wrap">
+            <button class="btn btn-primary btn-sm" @onclick="RefreshDirectAsync" disabled="@_loading">
+                @if (_loading) { <span class="spinner-border spinner-border-sm me-1"></span> }
+                立即 DI 直連讀取
+            </button>
+            <button class="btn btn-outline-secondary btn-sm" @onclick="RefreshDeviceInfoAsync" disabled="@_loading">
+                讀取設備資訊 (FC03 2000~2011)
+            </button>
+            <button class="btn btn-outline-info btn-sm" @onclick="RefreshAllAsync" disabled="@_loading">
+                全部刷新
+            </button>
+        </div>
+    </div>
+
+    @* ── 設備資訊 + 統計摘要 ──*@
+    <div class="row g-3 mb-3">
+
+        @* 設備資訊 (PDF 4.7 通訊參數寄存器) *@
+        <div class="col-md-6">
+            <div class="section-card h-100">
+                <div class="section-header">
+                    <h2 class="section-title">📋 設備資訊 <small class="text-muted fw-normal">(PDF §4.7 寄存器 2000~2011)</small></h2>
+                </div>
+                @if (_deviceInfo == null)
+                {
+                    <div class="text-muted small">尚未讀取——點擊「讀取設備資訊」</div>
+                }
+                else if (!string.IsNullOrEmpty(_deviceInfo.ErrorMessage))
+                {
+                    <div class="alert alert-danger py-2 mb-0 small">❌ @_deviceInfo.ErrorMessage</div>
+                }
+                else
+                {
+                    <table class="table table-sm table-bordered mb-0 small">
+                        <tbody>
+                            <tr>
+                                <th class="table-light w-50">裝置地址 (Reg 2000)</th>
+                                <td><code>@_deviceInfo.DeviceAddress</code></td>
+                            </tr>
+                            <tr>
+                                <th class="table-light">RS232 鮑率 (Reg 2001)</th>
+                                <td>@_deviceInfo.Rs232BaudLabel bps <span class="text-muted">(code @_deviceInfo.Rs232BaudCode)</span></td>
+                            </tr>
+                            <tr>
+                                <th class="table-light">RS485 鮑率 (Reg 2002)</th>
+                                <td>@_deviceInfo.Rs485BaudLabel bps <span class="text-muted">(code @_deviceInfo.Rs485BaudCode)</span></td>
+                            </tr>
+                            <tr>
+                                <th class="table-light">主動上傳模式 (Reg 2010)</th>
+                                <td>@_deviceInfo.ActiveUploadDescription <span class="text-muted">(code @_deviceInfo.ActiveUploadFlag)</span></td>
+                            </tr>
+                            <tr>
+                                <th class="table-light">上傳時間間隔 (Reg 2011)</th>
+                                <td>@_deviceInfo.ActiveUploadTimeDescription <span class="text-muted">(raw @_deviceInfo.ActiveUploadTimeUnit)</span></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                }
+            </div>
+        </div>
+
+        @* 統計摘要 *@
+        <div class="col-md-6">
+            <div class="section-card h-100">
+                <div class="section-header">
+                    <h2 class="section-title">📊 DI 統計摘要</h2>
+                </div>
+                <div class="row text-center g-2">
+                    <div class="col-6">
+                        <div class="stat-box bg-success text-white">
+                            <div class="stat-num">@ServiceOnCount</div>
+                            <div class="stat-label">背景輪詢 ON</div>
+                        </div>
+                    </div>
+                    <div class="col-6">
+                        <div class="stat-box bg-secondary text-white">
+                            <div class="stat-num">@(32 - ServiceOnCount)</div>
+                            <div class="stat-label">背景輪詢 OFF</div>
+                        </div>
+                    </div>
+                    @if (_directResult != null && string.IsNullOrEmpty(_directResult.ErrorMessage))
+                    {
+                        <div class="col-6">
+                            <div class="stat-box bg-primary text-white">
+                                <div class="stat-num">@DirectOnCount</div>
+                                <div class="stat-label">直連讀取 ON</div>
+                            </div>
+                        </div>
+                        <div class="col-6">
+                            <div class="stat-box @(DiffCount > 0 ? "bg-warning text-dark" : "bg-light text-dark")">
+                                <div class="stat-num">@DiffCount</div>
+                                <div class="stat-label">差異點數</div>
+                            </div>
+                        </div>
+                    }
+                </div>
+
+                {{!-- 原始 Byte 值 --}}
+                @if (_directResult != null && string.IsNullOrEmpty(_directResult.ErrorMessage))
+                {
+                    <div class="mt-3">
+                        <div class="section-subtitle mb-1">直連原始 Byte (HEX / BIN)：</div>
+                        @foreach (var (byteVal, idx) in RawBytes.Select((b, i) => (b, i)))
+                        {
+                            <span class="badge bg-light text-dark border me-1 mb-1 font-monospace">
+                                B@idx: 0x@byteVal.ToString("X2") / @Convert.ToString(byteVal, 2).PadLeft(8, '0')
+                            </span>
+                        }
+                    </div>
+                }
+            </div>
+        </div>
+    </div>
+
+    @* ── DI 通道格線 ──*@
+    <div class="section-card mb-3">
+        <div class="section-header">
+            <h2 class="section-title">🔌 DI 通道狀態格線（32 點）</h2>
+            <div class="d-flex gap-3 align-items-center small">
+                <span><span class="legend-dot bg-success"></span> 背景 ON</span>
+                <span><span class="legend-dot bg-secondary opacity-50"></span> 背景 OFF</span>
+                @if (_directResult != null)
+                {
+                    <span><span class="legend-dot border border-primary"></span> 直連不同</span>
+                }
+            </div>
+        </div>
+        <div class="di-grid">
+            @for (int i = 0; i < 32; i++)
+            {
+                int idx = i;
+                bool svcOn  = idx < ModbusService.DiStatus.Count && ModbusService.DiStatus[idx];
+                bool dirOn  = _directResult?.Status != null && idx < _directResult.Status.Count && _directResult.Status[idx];
+                bool hasDiff = _directResult != null && string.IsNullOrEmpty(_directResult.ErrorMessage) && svcOn != dirOn;
+                string cardCls = svcOn ? "di-cell on" : "di-cell off";
+                if (hasDiff) cardCls += " diff";
+
+                <div class="@cardCls">
+                    <div class="di-label">DI@((idx + 1).ToString("D2"))</div>
+                    <div class="di-state-svc">@(svcOn ? "ON" : "OFF")</div>
+                    @if (_directResult != null && string.IsNullOrEmpty(_directResult.ErrorMessage))
+                    {
+                        <div class="di-state-dir @(dirOn ? "dir-on" : "dir-off")">直連@(dirOn ? "ON" : "OFF")</div>
+                    }
+                </div>
+            }
+        </div>
+    </div>
+
+    @* ── 差異詳情 ──*@
+    @if (_directResult != null && string.IsNullOrEmpty(_directResult.ErrorMessage) && DiffCount > 0)
+    {
+        <div class="section-card mb-3">
+            <div class="section-header">
+                <h2 class="section-title text-warning">⚠️ 差異通道清單</h2>
+            </div>
+            <div class="row g-2">
+                @foreach (int i in DiffIndexes)
+                {
+                    bool svcOn = i < ModbusService.DiStatus.Count && ModbusService.DiStatus[i];
+                    bool dirOn = i < _directResult.Status.Count && _directResult.Status[i];
+                    <div class="col-auto">
+                        <div class="alert alert-warning py-1 px-2 mb-0 small">
+                            <strong>DI@((i+1).ToString("D2"))：</strong>
+                            背景=<strong>@(svcOn ? "ON" : "OFF")</strong>　
+                            直連=<strong>@(dirOn ? "ON" : "OFF")</strong>
+                        </div>
+                    </div>
+                }
+            </div>
+        </div>
+    }
+
+    @* ── 背景輪詢 Active List ──*@
+    <div class="section-card">
+        <div class="section-header">
+            <h2 class="section-title">📋 Active 通道列表</h2>
+        </div>
+        <div class="row g-3">
+            <div class="col-md-6">
+                <div class="section-subtitle mb-1">背景輪詢 ON 通道：</div>
+                <div class="font-monospace">@ServiceActiveList</div>
+            </div>
+            @if (_directResult != null && string.IsNullOrEmpty(_directResult.ErrorMessage))
+            {
+                <div class="col-md-6">
+                    <div class="section-subtitle mb-1">直連讀取 ON 通道：</div>
+                    <div class="font-monospace">@DirectActiveList</div>
+                </div>
+            }
+        </div>
+    </div>
+
+</div>
+
+@code {
+    private System.Threading.Timer? _timer;
+    private bool _isDisposed = false;
+    private bool _loading = false;
+    private ModbusDataService.DiReadResult? _directResult;
+    private ModbusDataService.DeviceInfo?   _deviceInfo;
+
+    private int ServiceOnCount  => ModbusService.DiStatus.Count(x => x);
+    private int DirectOnCount   => _directResult?.Status?.Count(x => x) ?? 0;
+
+    private IEnumerable<int> DiffIndexes => _directResult == null || !string.IsNullOrEmpty(_directResult.ErrorMessage)
+        ? Enumerable.Empty<int>()
+        : Enumerable.Range(0, 32).Where(i =>
+        {
+            bool svc = i < ModbusService.DiStatus.Count && ModbusService.DiStatus[i];
+            bool dir = i < _directResult.Status.Count && _directResult.Status[i];
+            return svc != dir;
+        });
+
+    private int DiffCount => DiffIndexes.Count();
+
+    private string ServiceActiveList => FormatActiveList(ModbusService.DiStatus);
+    private string DirectActiveList  => _directResult == null ? "-" : FormatActiveList(_directResult.Status);
+
+    private byte[] RawBytes => _directResult?.Status == null
+        ? Array.Empty<byte>()
+        : Enumerable.Range(0, (int)Math.Ceiling(_directResult.Status.Count / 8.0))
+            .Select(byteIdx =>
+            {
+                byte b = 0;
+                for (int bit = 0; bit < 8; bit++)
+                {
+                    int ch = byteIdx * 8 + bit;
+                    if (ch < _directResult.Status.Count && _directResult.Status[ch])
+                        b |= (byte)(1 << bit);
+                }
+                return b;
+            }).ToArray();
+
+    protected override void OnInitialized()
+    {
+        ModbusService.DataUpdated += OnDataUpdated;
+        _timer = new System.Threading.Timer(async _ =>
+        {
+            if (!_isDisposed) await InvokeAsync(StateHasChanged);
+        }, null, 0, 1000);
+    }
+
+    private async Task RefreshDirectAsync()
+    {
+        _loading = true;
+        StateHasChanged();
+        _directResult = await ModbusService.ReadDiStatusDirectAsync(0, 32);
+        _loading = false;
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task RefreshDeviceInfoAsync()
+    {
+        _loading = true;
+        StateHasChanged();
+        _deviceInfo = await ModbusService.ReadDeviceInfoAsync();
+        _loading = false;
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task RefreshAllAsync()
+    {
+        _loading = true;
+        StateHasChanged();
+        var t1 = ModbusService.ReadDiStatusDirectAsync(0, 32);
+        var t2 = ModbusService.ReadDeviceInfoAsync();
+        await Task.WhenAll(t1, t2);
+        _directResult = await t1;
+        _deviceInfo   = await t2;
+        _loading = false;
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private string FormatActiveList(List<bool> statuses)
+    {
+        var active = statuses
+            .Select((v, i) => new { v, i })
+            .Where(x => x.v)
+            .Select(x => $"DI{x.i + 1:D2}")
+            .ToList();
+        return active.Count > 0 ? string.Join(", ", active) : "（無 ON 通道）";
+    }
+
+    private async void OnDataUpdated()
+    {
+        if (!_isDisposed) await InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose()
+    {
+        _isDisposed = true;
+        ModbusService.DataUpdated -= OnDataUpdated;
+        _timer?.Dispose();
+    }
+}
+
+<style>
+    .monitor-container {
+        padding: 1.25rem 1.5rem;
+        max-width: 1400px;
+        margin: 0 auto;
+        background: #f5f7fa;
+        min-height: 100vh;
+        font-size: 0.9rem;
+    }
+
+    .header-section {
+        background: white;
+        border-radius: 12px;
+        padding: 1.5rem;
+        box-shadow: 0 4px 6px rgba(0,0,0,.08);
+        margin-bottom: 1.25rem;
+    }
+
+    .page-title {
+        font-size: 1.4rem;
+        font-weight: 700;
+        margin: 0;
+    }
+
+    .icon-oven { font-size: 1.4rem; margin-right: .4rem; }
+
+    .info-bar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 1.5rem;
+        margin-top: 1rem;
+        padding-top: 1rem;
+        border-top: 1px solid #e0e0e0;
+    }
+
+    .info-item { display: flex; gap: .4rem; }
+    .info-label { font-weight: 600; color: #666; font-size: .82rem; }
+    .info-value { color: #333; font-size: .82rem; }
+
+    .section-card {
+        background: white;
+        border-radius: 12px;
+        padding: 1.25rem;
+        box-shadow: 0 4px 6px rgba(0,0,0,.08);
+    }
+
+    .section-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: .75rem;
+        padding-bottom: .5rem;
+        border-bottom: 1px solid #f0f0f0;
+    }
+
+    .section-title { font-size: 1rem; font-weight: 600; margin: 0; }
+    .section-subtitle { font-size: .8rem; color: #666; }
+
+    /* Stat boxes */
+    .stat-box {
+        border-radius: 10px;
+        padding: .75rem;
+    }
+
+    .stat-num { font-size: 2rem; font-weight: 700; line-height: 1; }
+    .stat-label { font-size: .75rem; margin-top: .25rem; }
+
+    /* DI Grid */
+    .di-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
+        gap: .5rem;
+    }
+
+    .di-cell {
+        border-radius: 8px;
+        padding: .5rem .4rem;
+        text-align: center;
+        border: 2px solid transparent;
+        transition: background .2s;
+    }
+
+    .di-cell.on  { background: #d1fae5; border-color: #10b981; }
+    .di-cell.off { background: #f3f4f6; border-color: #d1d5db; }
+    .di-cell.diff { outline: 2px solid #3b82f6; }
+
+    .di-label     { font-size: .7rem; font-weight: 600; color: #555; }
+    .di-state-svc { font-size: .85rem; font-weight: 700; color: #111; }
+    .di-state-dir { font-size: .65rem; margin-top: .15rem; }
+    .dir-on  { color: #059669; }
+    .dir-off { color: #9ca3af; }
+
+    /* Legend */
+    .legend-dot {
+        display: inline-block;
+        width: 12px;
+        height: 12px;
+        border-radius: 3px;
+        margin-right: 3px;
+    }
+
+    @@media (max-width: 768px) {
+        .info-bar { gap: .75rem; }
+        .di-grid  { grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); }
+    }
+</style>

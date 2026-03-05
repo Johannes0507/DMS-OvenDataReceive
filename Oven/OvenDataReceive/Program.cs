@@ -10,6 +10,9 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddRazorComponents()
     .AddInteractiveServerComponents();
 
+// 註冊 API Controllers
+builder.Services.AddControllers();
+
 // 註冊 Modbus 數據服務
 builder.Services.AddSingleton<ModbusDataService>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<ModbusDataService>());
@@ -50,6 +53,7 @@ app.UseHttpsRedirection();
 app.UseAntiforgery();
 
 app.MapStaticAssets();
+app.MapControllers(); // 註冊 API 路由
 app.MapRazorComponents<App>()
     .AddInteractiveServerRenderMode();
 

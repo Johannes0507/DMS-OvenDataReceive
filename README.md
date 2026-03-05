@@ -1,6 +1,6 @@
 # 烤箱數據監控系統 (Oven Data Receive)
 
-一個基於 Blazor Server 的 Modbus TCP 數據監控系統，用於即時監控烤箱設備的開關量狀態和溫度數據。
+一個基於 Blazor Server 的 Modbus TCP 數據監控系統，用於即時監控烤箱設備的開關量狀態和溫度數據。支援**集中式模組**架構，可從單一端點一次讀取全部 12 路溫度。
 
 ## 📋 目錄
 
@@ -13,14 +13,18 @@
 - [配置參數](#配置參數)
 - [注意事項](#注意事項)
 - [技術架構](#技術架構)
+- [除錯與故障排除](#除錯與故障排除)
 
 ## ✨ 功能特點
 
 - ✅ **即時數據監控** - 支援 Modbus TCP 協議，即時讀取設備數據
 - ✅ **開關量輸入 (DI)** - 監控 32 路離散輸入狀態
-- ✅ **溫度監控** - 支援 12 個 ADTEK CM1 溫度表讀取
+- ✅ **溫度監控** - 支援 12 路溫度感測器（集中式模組批次讀取）
 - ✅ **自動重連** - 連接斷開時自動重試連接
 - ✅ **即時更新** - 可配置的數據讀取間隔（預設 2000ms）
+- ✅ **錯誤記錄** - 自動寫入 `Logs/Error.txt`（保留最近 200 筆）
+- ✅ **暫存器掃描診斷** - 可選啟用，掃描 Holding/Input 暫存器並輸出至 `Logs/RegisterScan.txt`
+- ✅ **多組暫存器候選** - 可依序嘗試多組地址，自動選擇有效位址
 
 ## 💻 系統需求
 
@@ -48,9 +52,15 @@
 ### 3. 設備配置
 
 確保設備已正確配置：
-- **IP 地址**：預設為 `192.168.61.144`（可透過設備管理軟體修改）
+- **IP 地址**：預設為 `192.168.61.74`（可透過 `appsettings.json` 修改）
 - **Modbus TCP 端口**：預設為 `4196`
-- **設備地址 (Unit ID)**：預設為 `1`
+- **設備地址 (Unit ID)**：DI 與溫度共用，預設為 `255`
+
+### 4. RS485 串聯架構（重要）
+
+現場採用 **RS485 串聯 (Daisy Chain)**，其中**藥水箱（站號 2、3）**為線路前段關鍵節點。
+
+**若站號 2 或 3 斷電或斷線，將導致後續串聯的站點無法通訊。** 請在現場佈線與維修時特別注意此兩站狀態。
 
 ## 📦 安裝與配置
 
@@ -69,18 +79,28 @@ dotnet restore
 
 ### 3. 配置應用程式
 
-編輯 `appsettings.json` 檔案：
+編輯 `Oven/OvenDataReceive/appsettings.json` 檔案：
 
 ```json
 {
   "Modbus": {
-    "IpAddress": "192.168.61.144",     // Modbus TCP 閘道器 IP 地址
+    "IpAddress": "192.168.61.74",       // Modbus TCP 閘道器 IP 地址
     "Port": 4196,                       // Modbus TCP 端口
     "DiUnitId": 255,                    // DI 採集器 Unit ID
-    "TempSensorCount": 12,              // 溫度感測器數量（Unit ID 1-12）
-    "TempRegisterAddr": 0,              // 溫度寄存器地址（ADTEK CM1 PV = 0x0000）
-    "ReadIntervalMs": 2000,             // 讀取間隔（毫秒，範圍：500-10000）
-    "SensorTimeoutMs": 1000             // 單一感測器超時（毫秒，範圍：200-5000）
+    "TempSensorCount": 12,              // 溫度感測器數量
+    "TempUnitId": 255,                  // 溫度裝置 Unit ID（與 DI 共用站號）
+    "TempRegisterAddr": 40001,          // 溫度寄存器基底地址（集中式模組常用 40001）
+    "TempRegisterAddrCandidates": "40001,40002,0,30001",  // 候選地址，依序嘗試直到讀到非零
+    "TempRegisterStride": 1,            // 每感測器寄存器步進
+    "TempBulkRead": true,               // 是否優先批次讀取
+    "TempScale": 0.1,                   // 溫度換算係數（Raw * Scale）
+    "TempUseSigned": false,             // 是否以有符號整數解析 Raw
+    "TempSwapBytes": true,              // 是否交換高低位元組
+    "ReadIntervalMs": 2000,
+    "SensorTimeoutMs": 1000,
+    "RegisterScanEnabled": false,       // 暫存器掃描診斷（啟用後寫入 Logs/RegisterScan.txt）
+    "RegisterScanStart": 0,
+    "RegisterScanCount": 64
   }
 }
 ```
@@ -89,11 +109,21 @@ dotnet restore
 
 | 參數 | 說明 | 預設值 | 範圍 |
 |------|------|--------|------|
-| `IpAddress` | Modbus TCP 閘道器的 IP 地址 | `192.168.61.144` | - |
+| `IpAddress` | Modbus TCP 閘道器 IP 地址 | `192.168.61.74` | - |
 | `Port` | Modbus TCP 端口 | `4196` | 1-65535 |
 | `DiUnitId` | DI 採集器 Unit ID | `255` | 1-255 |
-| `TempSensorCount` | 溫度感測器數量（每個感測器的 Unit ID = 序號） | `12` | 1-32 |
-| `TempRegisterAddr` | 溫度寄存器地址（ADTEK CM1 PV = 0） | `0` | 0-65535 |
+| `TempUnitId` | 溫度裝置 Unit ID | `255` | 1-255 |
+| `TempSensorCount` | 溫度感測器數量 | `12` | 1-32 |
+| `TempRegisterAddr` | 溫度寄存器基底地址（40001 = Holding 第一個） | `40001` | 0-65535 |
+| `TempRegisterAddrCandidates` | 暫存器候選地址，逗號分隔，依序嘗試 | `"40001,40002,0,30001"` | - |
+| `TempRegisterStride` | 每感測器寄存器步進 | `1` | 1-16 |
+| `TempBulkRead` | 是否優先批次讀取（一次讀 12 筆） | `true` | true/false |
+| `TempScale` | 溫度換算係數（實際溫度 = Raw × Scale） | `0.1` | > 0 |
+| `TempUseSigned` | 是否以有符號整數解析 Raw | `false` | true/false |
+| `TempSwapBytes` | 是否交換高低位元組 | `true` | true/false |
+| `RegisterScanEnabled` | 啟用暫存器掃描診斷（寫入 RegisterScan.txt） | `false` | true/false |
+| `RegisterScanStart` | 掃描起始地址（0-based） | `0` | 0-65535 |
+| `RegisterScanCount` | 掃描寄存器數量 | `64` | 1-128 |
 | `ReadIntervalMs` | 數據讀取間隔（毫秒） | `2000` | 500-10000 |
 | `SensorTimeoutMs` | 單一感測器超時（毫秒） | `1000` | 200-5000 |
 
@@ -102,12 +132,13 @@ dotnet restore
 ### 開發模式
 
 ```bash
+cd Oven/OvenDataReceive
 dotnet run
 ```
 
-應用程式將在以下地址啟動：
-- HTTP: `http://localhost:5000`
-- HTTPS: `https://localhost:5001`
+應用程式預設在 **Port 5133** 啟動，例如：
+- HTTP: `http://localhost:5133`
+- 區域網路: `http://<本機IP>:5133`
 
 ### 生產模式
 
@@ -126,19 +157,20 @@ dotnet publish -c Release -o ./publish
 
 ### 1. 訪問應用
 
-開啟瀏覽器，訪問 `http://localhost:5000` 或 `https://localhost:5001`
+開啟瀏覽器，訪問 `http://localhost:5133`（或本機實際 IP 與端口）
 
 ### 2. 監控頁面
 
 導航至「監控」頁面 (`/monitor`)，您將看到：
 
 #### **站點監控**
-- 顯示 12 個溫度感測站的即時狀態（ADTEK CM1 溫度表）
-- DI 狀態控制：DI = ON 時讀取溫度，DI = OFF 時設備停止
+- 顯示 12 個溫度感測站的即時狀態
+- DI 狀態指示：Running / Standby
 - 按設備類別分組顯示：
-  - 🔥 **加硫與處理劑設備**：加硫機、藥水箱
-  - 💧 **膠水活化/乾燥烘箱**：一次膠、二次膠
-  - ❄️ **冷卻與定型設備**：冷凍機、冷熱定型機
+  - 後跟定型（冷/熱）
+  - 高速加熱定型機
+  - 藥水箱與膠水活化
+  - 冷凍系統
 
 #### **溫度顯示**
 - 根據溫度範圍顯示不同顏色：
@@ -148,44 +180,58 @@ dotnet publish -c Release -o ./publish
   - 🔴 高溫：≥ 200°C
   - 🩵 低溫：< 0°C（冷凍設備）
 
-#### **其他開關量 (DI13-DI32)**
-- 顯示額外的離散輸入狀態
-
-### 3. 連接狀態
+### 3. 連接狀態與提示
 
 頁面頂部顯示設備連接狀態：
 - 🟢 **已連線** - 設備正常連接
 - 🔴 **未連線** - 無法連接到設備
 
+當未連線或藥水箱（站號 2、3）發生錯誤時，會顯示 **硬體接線提示**：提醒藥水箱為 RS485 串聯關鍵節點，斷線將導致後續站點無法通訊。
+
+若有錯誤記錄，會顯示 **最近錯誤紀錄**（最新 5 筆），來源為 `Logs/Error.txt`。
+
+### 4. DI 對照測試
+
+新增「DI 對照測試」頁面 (`/di-compare`)，可同時查看：
+- **背景輪詢（Service）** 的 DI 狀態
+- **即時直連（FC02 / 起始 0 / 32）** 的 DI 狀態
+
+此頁面會將直連結果寫入 `Logs/DiDiagnostic.txt` 供診斷比對。
+
 ## ⚙️ 配置參數
 
-### 溫度感測器（ADTEK CM1 系列）
+### 溫度感測器與集中式模組
 
-本系統使用 **ADTEK CM1 系列數位溫度表**，透過 RS485 轉 Modbus TCP 閘道器進行通訊。
+本系統支援 **集中式 Modbus TCP 模組**，從單一端點一次讀取全部 12 路溫度（基底地址 40001 起，每路 1 個寄存器）。
 
 **Modbus 通訊規格：**
-- 寄存器地址：`0x0000`（PV 顯示值）
-- 功能碼：03 (Read Holding Registers) 或 04 (Read Input Registers)
-- 數據類型：16 位元有符號整數（`short`）
+- 寄存器：Holding (4xxxx, FC03) 或 Input (3xxxx, FC04)，可透過候選地址自動嘗試
+- 數據類型：16 位元整數（可選 signed/unsigned、SwapBytes）
 
-**溫度換算公式：**
+**溫度換算（可配置）：**
 ```
-實際溫度 = RawValue / 10.0
+實際溫度 = RawValue × TempScale
 ```
+預設 `TempScale = 0.1`，即 Raw 256 → 25.6°C。
 
-**範例：**
+**範例（TempScale=0.1）：**
 | 原始值 (Raw) | 實際溫度 |
 |-------------|---------|
-| 1525 | 152.5°C |
-| 250 | 25.0°C |
-| -100 | -10.0°C |
+| 768 | 76.8°C |
+| 256 | 25.6°C |
+| 1024 | 102.4°C |
 
-**有效範圍：**
-- 原始值：-1999 ~ 9999
-- 對應溫度：-199.9°C ~ 999.9°C
+**暫存器掃描診斷：**
+若 `RegisterScanEnabled=true`，啟動後會掃描 Holding 與 Input 暫存器並寫入 `Logs/RegisterScan.txt`，可依此找出實際有資料的位址，再更新 `TempRegisterAddr` 或 `TempRegisterAddrCandidates`。
 
-**錯誤處理：**
-- 若原始值 < -1999（如 65535 → -1），代表感測器異常，溫度顯示為 0
+**Log 檔案：**
+| 檔案 | 說明 |
+|------|------|
+| `Logs/RawData.txt` | 溫度 Raw 值記錄（最近 200 筆） |
+| `Logs/TemperatureRecording.txt` | 溫度換算記錄 |
+| `Logs/Error.txt` | 錯誤記錄（最近 200 筆） |
+| `Logs/DiDiagnostic.txt` | DI 直連診斷記錄（最近 200 筆） |
+| `Logs/RegisterScan.txt` | 暫存器掃描結果（啟用掃描時產生） |
 
 ## ⚠️ 注意事項
 
@@ -193,16 +239,16 @@ dotnet publish -c Release -o ./publish
 
 本系統使用以下設備：
 - **SHZK-DI 開關量采集器**：負責讀取 32 路 DI 狀態
-- **ADTEK CM1 數位溫度表**：12 台，透過 RS485 連接
-- **Modbus TCP 閘道器**：將 RS485 轉換為 Modbus TCP
+- **集中式溫度模組**：彙整 12 路溫度，從單一端點以 Modbus TCP 提供（基底地址 40001）
+- **RS485 串聯**：藥水箱（站號 2、3）為前段關鍵節點，此兩站斷線將影響後續站點通訊
 
 ### 2. 網路連接
 
 - 確保設備與電腦在同一區域網路
-- 檢查防火牆設定，確保端口 `4196` 未被阻擋
-- 使用 `ping` 命令測試設備連通性：
-  ```bash
-  ping 192.168.61.144
+- 檢查防火牆設定，確保 Modbus 端口 `4196` 與 Web 端口 `5133` 未被阻擋
+- 使用 `Test-NetConnection` 測試 Modbus 連線：
+  ```powershell
+  Test-NetConnection -ComputerName 192.168.61.74 -Port 4196
   ```
 
 ### 3. 讀取間隔設定
@@ -213,9 +259,10 @@ dotnet publish -c Release -o ./publish
 
 ### 4. 錯誤處理
 
-- 連接失敗時，系統會自動重試（間隔 1 秒）
+- 連接失敗時，系統會自動重試（間隔 2 秒）
 - 讀取失敗時，會保留上次成功讀取的數據
-- 查看應用程式日誌以獲取詳細錯誤資訊
+- 錯誤會自動寫入 `Logs/Error.txt`（最近 200 筆）
+- 監控頁面會顯示最近 5 筆錯誤紀錄
 
 ## 🏗️ 技術架構
 
@@ -229,51 +276,67 @@ dotnet publish -c Release -o ./publish
 ### 專案結構
 
 ```
-OvenDataReceive/
-├── Components/
-│   ├── Pages/
-│   │   ├── Monitor.razor      # 監控頁面
-│   │   └── Home.razor         # 首頁
-│   └── Layout/
-│       └── MainLayout.razor   # 主佈局
-├── Services/
-│   └── ModbusDataService.cs   # Modbus 數據服務
-├── Program.cs                  # 應用程式入口
-├── appsettings.json           # 配置文件
-└── OvenDataReceive.csproj     # 專案文件
+Oven/
+└── OvenDataReceive/
+    ├── Components/
+    │   ├── Pages/
+    │   │   ├── Monitor.razor      # 監控頁面
+    │   │   ├── DiMonitor.razor    # DI 監控頁面
+    │   │   └── DiCompare.razor    # DI 對照測試頁面
+    │   └── Layout/
+    │       └── MainLayout.razor   # 主佈局
+    ├── Services/
+    │   └── ModbusDataService.cs   # Modbus 數據服務
+    ├── Program.cs                 # 應用程式入口
+    ├── appsettings.json          # 配置文件
+    └── Logs/                     # 執行時產生
+        ├── RawData.txt           # 溫度 Raw 值
+        ├── TemperatureRecording.txt
+        ├── Error.txt             # 錯誤記錄
+        └── RegisterScan.txt      # 暫存器掃描（啟用時）
 ```
 
 ### 核心服務
 
 **ModbusDataService** (`Services/ModbusDataService.cs`)
 - 負責 Modbus TCP 連接管理
-- 定期讀取設備數據
-- 提供線程安全的數據訪問接口
-- 支援自動重連機制
+- 批次或逐筆讀取 12 路溫度（可配置）
+- 支援暫存器候選地址自動探測
+- 可選暫存器掃描診斷模式
+- 錯誤寫入 Error.txt，提供 ErrorLogs 供 UI 顯示
 
 ## 🔍 除錯與故障排除
+
+### 問題：Port 5133 已被佔用 (address already in use)
+
+**解決方案：**
+```powershell
+netstat -ano | findstr :5133    # 查詢佔用行程 PID
+taskkill /PID <PID> /F          # 終止該行程
+```
 
 ### 問題：無法連接到設備
 
 **解決方案：**
-1. 檢查設備 IP 地址是否正確
+1. 檢查設備 IP 地址是否正確（預設 192.168.61.74）
 2. 確認設備已開機並連接到網路
-3. 檢查端口號是否正確（預設 4196）
-4. 使用 Modbus 測試工具（如 Modbus Poll）驗證設備連接
+3. 檢查 Modbus 端口是否為 4196
+4. 使用 `Test-NetConnection -ComputerName <IP> -Port 4196` 測試 TCP 連線
+5. 使用 Modbus 測試工具（如 Modbus Poll）驗證設備連接
 
-### 問題：溫度數據顯示為 0
+### 問題：溫度數據全部顯示為 0
 
 **解決方案：**
-1. 確認對應的 DI 狀態是否為 ON（DI = OFF 時不會讀取溫度）
-2. 檢查 ADTEK CM1 溫度表是否正常運作
-3. 檢查 RS485 通訊線路是否正常
-4. 查看日誌檔案 `Logs/RawData.txt` 確認原始數據
-5. 若原始值顯示為負數且 < -1999，代表感測器異常
+1. 檢視 `Logs/RawData.txt`：若 Raw 全為 0，可能是暫存器地址錯誤
+2. 啟用暫存器掃描：設定 `RegisterScanEnabled: true`，重啟後查看 `Logs/RegisterScan.txt` 找出有非零值的位址
+3. 調整 `TempRegisterAddrCandidates`：依掃描結果加入正確地址（如 `"40002,40001,30001"`）
+4. 確認 `TempUnitId` 與設備站號一致（預設 255）
+5. 向廠商索取完整 Modbus 暫存器對應表（Register Map）
 
 ### 問題：數據更新延遲
 
 **解決方案：**
-1. 降低 `ReadIntervalMs` 值（建議不低於 100ms）
+1. 降低 `ReadIntervalMs` 值（建議不低於 500ms）
 2. 檢查網路延遲
 3. 確認設備響應速度
 
@@ -287,5 +350,5 @@ OvenDataReceive/
 
 ---
 
-**最後更新**：2026年1月
+**最後更新**：2026年3月
 
