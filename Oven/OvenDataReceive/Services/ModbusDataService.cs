@@ -3,6 +3,8 @@ using System.Net;
 using System.Net.Sockets;
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Text;
+using System.Text.Json;
 using FluentModbus;
 
 namespace OvenDataReceive.Services
@@ -23,6 +25,7 @@ namespace OvenDataReceive.Services
         private readonly int _tempRegisterStride;  // 溫度寄存器步進（每一感測器偏移）
         private readonly int _readIntervalMs;      // 讀取週期（毫秒）
         private readonly int _sensorTimeoutMs;     // 單一感測器超時（毫秒）
+        private readonly byte[] _tcpQueryCommand;  // 溫度查詢指令 (TCP Hex)
         private readonly double _tempScale;        // 溫度縮放比例（Raw * Scale）
         private readonly bool _tempUseSigned;      // 是否以 signed 解析 Raw
         private readonly bool _tempSwapBytes;      // 是否交換高低位元組
@@ -210,6 +213,7 @@ namespace OvenDataReceive.Services
             _tempUseSigned = ReadBoolSetting(_configuration["Modbus:TempUseSigned"], true);
             _tempSwapBytes = ReadBoolSetting(_configuration["Modbus:TempSwapBytes"], false);
             _tempBulkRead = ReadBoolSetting(_configuration["Modbus:TempBulkRead"], true);
+            _tcpQueryCommand = ParseHexCommand(_configuration["Modbus:TcpQueryHex"], "12FF0030");
             _registerScanEnabled = ReadBoolSetting(_configuration["Modbus:RegisterScanEnabled"], false);
             _registerScanStart = Math.Max(0, int.Parse(_configuration["Modbus:RegisterScanStart"] ?? "0"));
             _registerScanCount = Math.Clamp(int.Parse(_configuration["Modbus:RegisterScanCount"] ?? "64"), 1, 128);
@@ -277,9 +281,9 @@ namespace OvenDataReceive.Services
                 int.Parse(_configuration["Modbus:ReadIntervalMs"] ?? "2000"), 
                 500, 10000);
             
-            // 單一感測器超時：預設 1000ms (1秒)
+            // 溫度讀取超時：預設 3000ms (3秒)
             _sensorTimeoutMs = Math.Clamp(
-                int.Parse(_configuration["Modbus:SensorTimeoutMs"] ?? "1000"), 
+                int.Parse(_configuration["Modbus:SensorTimeoutMs"] ?? "3000"), 
                 200, 5000);
             
             // 初始化溫度陣列（全部設為 0）
@@ -297,15 +301,9 @@ namespace OvenDataReceive.Services
             _logger.LogInformation($"  連線目標: {_ipAddress}:{_port}");
             _logger.LogInformation($"  DI 採集器 UnitID: {_diUnitId}");
             _logger.LogInformation($"  溫度感測器: {_tempSensorCount} 個");
-            _logger.LogInformation($"  溫度裝置 UnitID: {_tempUnitId}");
-            _logger.LogInformation($"  溫度寄存器: 基底地址={_tempRegisterAddr}, 步進={_tempRegisterStride}");
-            if (_tempRegisterAddrCandidates.Count > 0)
-                _logger.LogInformation($"  暫存器候選: {string.Join(", ", _tempRegisterAddrCandidates)}");
-            _logger.LogInformation($"  溫度縮放比例: {_tempScale} (Raw * Scale)");
-            _logger.LogInformation($"  溫度原始值解析: {(_tempUseSigned ? "signed" : "unsigned")}");
-            _logger.LogInformation($"  交換高低位元組: {(_tempSwapBytes ? "是" : "否")}");
-            _logger.LogInformation($"  溫度讀取模式: {(_tempBulkRead ? "批次" : "逐筆")}");
-            _logger.LogInformation($"  暫存器掃描診斷: {(_registerScanEnabled ? $"開啟 (起點={_registerScanStart}, 數量={_registerScanCount})" : "關閉")}");
+            _logger.LogInformation($"  溫度讀取模式: TCP JSON");
+            _logger.LogInformation($"  溫度查詢指令: {BitConverter.ToString(_tcpQueryCommand)}");
+            _logger.LogInformation($"  暫存器掃描診斷(僅 Modbus 溫度): {(_registerScanEnabled ? $"開啟 (起點={_registerScanStart}, 數量={_registerScanCount})" : "關閉")}");
             _logger.LogInformation($"  讀取週期: {_readIntervalMs}ms");
             _logger.LogInformation($"  感測器超時: {_sensorTimeoutMs}ms");
             _logger.LogInformation("========================================");
@@ -337,8 +335,8 @@ namespace OvenDataReceive.Services
                     // Step 2: 讀取 DI 狀態
                     var diResult = ReadDiStatus();
                     
-                    // Step 3: 背景持續輪詢所有站點溫度
-                    var tempResult = await ReadTemperaturesAsync(stoppingToken);
+                    // Step 3: 以 TCP JSON 方式輪詢所有站點溫度
+                    var tempResult = await ReadTemperatureViaTcpJsonAsync(stoppingToken);
                     
                     // Step 4: 更新數據並通知 UI
                     UpdateData(diResult, tempResult.Temperatures, tempResult.Errors);
@@ -577,7 +575,76 @@ namespace OvenDataReceive.Services
         }
 
         /// <summary>
-        /// 背景持續輪詢溫度（不依賴 DI 狀態）
+        /// 透過 TCP 指令讀取 JSON 溫度資料（SSCOM 同型流程）
+        /// 指令預設: 12 FF 00 30
+        /// </summary>
+        private async Task<(List<double> Temperatures, List<string?> Errors)> ReadTemperatureViaTcpJsonAsync(CancellationToken stoppingToken)
+        {
+            var temperatures = Enumerable.Repeat(0d, _tempSensorCount).ToList();
+            var errors = Enumerable.Repeat<string?>(null, _tempSensorCount).ToList();
+
+            try
+            {
+                using var tcpClient = new TcpClient();
+                await tcpClient.ConnectAsync(_ipAddress, _port).WaitAsync(
+                    TimeSpan.FromMilliseconds(_sensorTimeoutMs),
+                    stoppingToken);
+
+                using var stream = tcpClient.GetStream();
+                stream.ReadTimeout = _sensorTimeoutMs;
+                stream.WriteTimeout = _sensorTimeoutMs;
+
+                await stream.WriteAsync(_tcpQueryCommand, stoppingToken);
+                await stream.FlushAsync(stoppingToken);
+
+                string payload = await ReadJsonPayloadAsync(stream, stoppingToken);
+                using var doc = JsonDocument.Parse(payload);
+                var source = doc.RootElement;
+                if (source.TryGetProperty("data", out var dataNode) && dataNode.ValueKind == JsonValueKind.Object)
+                {
+                    source = dataNode;
+                }
+
+                int successCount = 0;
+                for (int i = 1; i <= _tempSensorCount; i++)
+                {
+                    if (TryReadTempField(source, $"temp{i}", out var value))
+                    {
+                        temperatures[i - 1] = Math.Round(value, 1);
+                        successCount++;
+                    }
+                    else
+                    {
+                        errors[i - 1] = $"找不到 temp{i}";
+                    }
+                }
+
+                if (successCount == 0)
+                {
+                    const string message = "JSON 解析成功，但沒有任何 temp 欄位";
+                    for (int i = 0; i < errors.Count; i++)
+                        errors[i] = message;
+                    AppendErrorLog(message);
+                }
+                else
+                {
+                    _logger.LogInformation($"✅ TCP JSON 溫度讀取成功: {successCount}/{_tempSensorCount}");
+                }
+            }
+            catch (Exception ex)
+            {
+                var message = $"TCP JSON 溫度讀取失敗: {ex.Message}";
+                for (int i = 0; i < errors.Count; i++)
+                    errors[i] = message;
+                AppendErrorLog(message);
+                _logger.LogWarning(message);
+            }
+
+            return (temperatures, errors);
+        }
+
+        /// <summary>
+        /// 背景持續輪詢溫度（舊版 Modbus 方式）
         /// </summary>
         private async Task<(List<double> Temperatures, List<string?> Errors)> ReadTemperaturesAsync(CancellationToken stoppingToken)
         {
@@ -966,6 +1033,96 @@ namespace OvenDataReceive.Services
             {
                 _logger.LogDebug($"溫度記錄寫入失敗: {ex.Message}");
             }
+        }
+
+        private static byte[] ParseHexCommand(string? value, string defaultHex)
+        {
+            var normalized = (string.IsNullOrWhiteSpace(value) ? defaultHex : value)
+                .Replace(" ", string.Empty, StringComparison.Ordinal)
+                .Trim();
+
+            if (normalized.Length % 2 != 0)
+                throw new InvalidOperationException($"TcpQueryHex 長度必須為偶數: {normalized}");
+
+            var command = new byte[normalized.Length / 2];
+            for (int i = 0; i < command.Length; i++)
+            {
+                command[i] = Convert.ToByte(normalized.Substring(i * 2, 2), 16);
+            }
+            return command;
+        }
+
+        private static bool TryReadTempField(JsonElement source, string propertyName, out double value)
+        {
+            value = 0;
+            if (!source.TryGetProperty(propertyName, out var node))
+                return false;
+
+            if (node.ValueKind == JsonValueKind.Number && node.TryGetDouble(out var numeric))
+            {
+                value = numeric;
+                return true;
+            }
+
+            if (node.ValueKind == JsonValueKind.String &&
+                double.TryParse(node.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed))
+            {
+                value = parsed;
+                return true;
+            }
+
+            return false;
+        }
+
+        private async Task<string> ReadJsonPayloadAsync(NetworkStream stream, CancellationToken stoppingToken)
+        {
+            var buffer = new byte[256];
+            var sb = new StringBuilder();
+            var deadline = DateTime.UtcNow.AddMilliseconds(_sensorTimeoutMs * 2);
+            bool foundStart = false;
+            int braceDepth = 0;
+
+            while (!stoppingToken.IsCancellationRequested && DateTime.UtcNow < deadline)
+            {
+                int read = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), stoppingToken);
+                if (read <= 0)
+                    break;
+
+                var chunk = Encoding.UTF8.GetString(buffer, 0, read);
+                sb.Append(chunk);
+
+                foreach (char ch in chunk)
+                {
+                    if (ch == '{')
+                    {
+                        foundStart = true;
+                        braceDepth++;
+                    }
+                    else if (ch == '}' && foundStart)
+                    {
+                        braceDepth--;
+                        if (braceDepth == 0)
+                        {
+                            return ExtractJsonObject(sb.ToString());
+                        }
+                    }
+                }
+            }
+
+            var raw = sb.ToString();
+            if (string.IsNullOrWhiteSpace(raw))
+                throw new InvalidOperationException("未收到任何回應資料");
+
+            return ExtractJsonObject(raw);
+        }
+
+        private static string ExtractJsonObject(string raw)
+        {
+            int start = raw.IndexOf('{');
+            int end = raw.LastIndexOf('}');
+            if (start < 0 || end <= start)
+                throw new InvalidOperationException($"回應不是有效 JSON: {raw}");
+            return raw.Substring(start, end - start + 1);
         }
 
         private static double ReadTempScale(string? value)
