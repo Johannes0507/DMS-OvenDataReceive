@@ -23,7 +23,8 @@ namespace OvenDataReceive.Services
         private readonly byte _tempUnitId;         // 溫度裝置 UnitID（閘道器映射後的 ID）
         private readonly int _tempRegisterAddr;    // 溫度寄存器基底地址（閘道器映射後的地址）
         private readonly int _tempRegisterStride;  // 溫度寄存器步進（每一感測器偏移）
-        private readonly int _readIntervalMs;      // 讀取週期（毫秒）
+        private readonly int _diReadIntervalMs;    // DI 讀取週期（毫秒）
+        private readonly int _tempReadIntervalMs;  // 溫度讀取週期（毫秒）
         private readonly int _sensorTimeoutMs;     // 單一感測器超時（毫秒）
         private readonly byte[] _tcpQueryCommand;  // 溫度查詢指令 (TCP Hex)
         private readonly double _tempScale;        // 溫度縮放比例（Raw * Scale）
@@ -276,10 +277,13 @@ namespace OvenDataReceive.Services
                 File.WriteAllText(_errorLogPath, string.Empty);
             }
             
-            // 讀取週期：預設 2000ms (2秒)
-            _readIntervalMs = Math.Clamp(
-                int.Parse(_configuration["Modbus:ReadIntervalMs"] ?? "2000"), 
-                500, 10000);
+            // 讀取週期
+            _diReadIntervalMs = Math.Clamp(
+                int.Parse(_configuration["Modbus:DiReadIntervalMs"] ?? "1000"),
+                200, 10000);
+            _tempReadIntervalMs = Math.Clamp(
+                int.Parse(_configuration["Modbus:TempReadIntervalMs"] ?? "500"),
+                100, 10000);
             
             // 溫度讀取超時：預設 3000ms (3秒)
             _sensorTimeoutMs = Math.Clamp(
@@ -304,7 +308,8 @@ namespace OvenDataReceive.Services
             _logger.LogInformation($"  溫度讀取模式: TCP JSON");
             _logger.LogInformation($"  溫度查詢指令: {BitConverter.ToString(_tcpQueryCommand)}");
             _logger.LogInformation($"  暫存器掃描診斷(僅 Modbus 溫度): {(_registerScanEnabled ? $"開啟 (起點={_registerScanStart}, 數量={_registerScanCount})" : "關閉")}");
-            _logger.LogInformation($"  讀取週期: {_readIntervalMs}ms");
+            _logger.LogInformation($"  DI 讀取週期: {_diReadIntervalMs}ms");
+            _logger.LogInformation($"  溫度讀取週期: {_tempReadIntervalMs}ms");
             _logger.LogInformation($"  感測器超時: {_sensorTimeoutMs}ms");
             _logger.LogInformation("========================================");
         }
@@ -313,49 +318,130 @@ namespace OvenDataReceive.Services
         {
             // 等待應用程式完全啟動
             await Task.Delay(1000, stoppingToken);
-            
+
+            await Task.WhenAll(
+                RunDiLoopAsync(stoppingToken),
+                RunTempPushAsync(stoppingToken)
+            );
+        }
+
+        /// <summary>
+        /// DI 輪詢迴圈：每 DiReadIntervalMs 讀一次
+        /// </summary>
+        private async Task RunDiLoopAsync(CancellationToken stoppingToken)
+        {
             while (!stoppingToken.IsCancellationRequested)
             {
                 try
                 {
-                    // Step 1: 確保連線
                     if (!EnsureConnected())
                     {
                         await Task.Delay(2000, stoppingToken);
                         continue;
                     }
 
-                    // Step 1.5: 暫存器掃描診斷（僅執行一次）
                     if (_registerScanEnabled && !_registerScanExecuted)
                     {
                         RunRegisterScan();
                         _registerScanExecuted = true;
                     }
 
-                    // Step 2: 讀取 DI 狀態
-                    var diResult = ReadDiStatus();
-                    
-                    // Step 3: 以 TCP JSON 方式輪詢所有站點溫度
-                    var tempResult = await ReadTemperatureViaTcpJsonAsync(stoppingToken);
-                    
-                    // Step 4: 更新數據並通知 UI
-                    UpdateData(diResult, tempResult.Temperatures, tempResult.Errors);
-                    
-                    IsConnected = true;
-                    ErrorMessage = null;
+                    var diStatus = ReadDiStatus();
+                    UpdateDiData(diStatus);
                 }
+                catch (OperationCanceledException) { break; }
                 catch (Exception ex)
                 {
-                    SafeLogError($"❌ 執行異常: {ex.Message}");
-                    AppendErrorLog($"執行異常: {ex.Message}");
+                    SafeLogError($"❌ DI 讀取異常: {ex.Message}");
+                    AppendErrorLog($"DI 讀取異常: {ex.Message}");
                     IsConnected = false;
                     ErrorMessage = ex.Message;
                     DisconnectClient();
                 }
 
-                // 等待下一個讀取週期
-                await Task.Delay(_readIntervalMs, stoppingToken);
+                await Task.Delay(_diReadIntervalMs, stoppingToken);
             }
+        }
+
+        /// <summary>
+        /// 溫度推播迴圈：連線後持續接收設備主動推播的 JSON，斷線自動重連
+        /// </summary>
+        private async Task RunTempPushAsync(CancellationToken stoppingToken)
+        {
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                TcpClient? tcpClient = null;
+                try
+                {
+                    tcpClient = new TcpClient();
+                    _logger.LogInformation($"溫度推播：連線至 {_ipAddress}:{_port}...");
+                    await tcpClient.ConnectAsync(_ipAddress, _port)
+                        .WaitAsync(TimeSpan.FromMilliseconds(_sensorTimeoutMs), stoppingToken);
+
+                    _logger.LogInformation("✅ 溫度推播連線成功，持續接收中");
+
+                    var stream = tcpClient.GetStream();
+                    stream.ReadTimeout = 30_000; // 30 秒無資料視為斷線
+
+                    while (!stoppingToken.IsCancellationRequested)
+                    {
+                        // timeoutMs = 0 → 不設 deadline，靠 stream.ReadTimeout 30s 控制斷線
+                        var payload = await ReadJsonPayloadAsync(stream, stoppingToken, timeoutMs: 0);
+                        var (temperatures, errors) = ParseTemperaturePayload(payload);
+                        UpdateTempData(temperatures, errors);
+                    }
+                }
+                catch (OperationCanceledException) { break; }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning($"⚠️ 溫度推播中斷: {ex.Message}，2 秒後重連...");
+                    AppendErrorLog($"溫度推播中斷: {ex.Message}");
+                }
+                finally
+                {
+                    tcpClient?.Dispose();
+                }
+
+                await Task.Delay(2000, stoppingToken);
+            }
+        }
+
+        private (List<double> Temperatures, List<string?> Errors) ParseTemperaturePayload(string payload)
+        {
+            var temperatures = Enumerable.Repeat(0d, _tempSensorCount).ToList();
+            var errors = Enumerable.Repeat<string?>(null, _tempSensorCount).ToList();
+
+            using var doc = JsonDocument.Parse(payload);
+            var source = doc.RootElement;
+            if (source.TryGetProperty("data", out var dataNode) && dataNode.ValueKind == JsonValueKind.Object)
+                source = dataNode;
+
+            int successCount = 0;
+            for (int i = 1; i <= _tempSensorCount; i++)
+            {
+                if (TryReadTempField(source, $"temp{i}", out var value))
+                {
+                    temperatures[i - 1] = Math.Round(value, 1);
+                    successCount++;
+                }
+                else
+                {
+                    errors[i - 1] = $"找不到 temp{i}";
+                }
+            }
+
+            if (successCount == 0)
+            {
+                const string msg = "JSON 解析成功，但沒有任何 temp 欄位";
+                for (int i = 0; i < errors.Count; i++) errors[i] = msg;
+                AppendErrorLog(msg);
+            }
+            else
+            {
+                _logger.LogInformation($"✅ 溫度推播: {successCount}/{_tempSensorCount}");
+            }
+
+            return (temperatures, errors);
         }
 
         /// <summary>
@@ -960,6 +1046,42 @@ namespace OvenDataReceive.Services
             }
         }
 
+        private void UpdateDiData(List<bool> diStatus)
+        {
+            lock (_dataLock)
+            {
+                _diStatus = diStatus;
+                _lastUpdateTime = DateTime.Now;
+                _isConnected = true;
+                _errorMessage = null;
+            }
+
+            for (int i = 0; i < diStatus.Count; i++)
+                _diStatusCache[i + 1] = diStatus[i];
+
+            try { DataUpdated?.Invoke(); }
+            catch (Exception ex) { _logger.LogDebug($"UI 更新通知異常: {ex.Message}"); }
+        }
+
+        private void UpdateTempData(List<double> temperatures, List<string?> errors)
+        {
+            lock (_dataLock)
+            {
+                _temperatures = temperatures;
+                _temperatureErrors = errors;
+                _lastUpdateTime = DateTime.Now;
+            }
+
+            for (int i = 0; i < temperatures.Count; i++)
+            {
+                _temperatureCache[i + 1] = temperatures[i];
+                _temperatureErrorCache[i + 1] = i < errors.Count ? errors[i] : null;
+            }
+
+            try { DataUpdated?.Invoke(); }
+            catch (Exception ex) { _logger.LogDebug($"UI 更新通知異常: {ex.Message}"); }
+        }
+
         /// <summary>
         /// 安全斷開連線
         /// </summary>
@@ -1074,13 +1196,18 @@ namespace OvenDataReceive.Services
             return false;
         }
 
-        private async Task<string> ReadJsonPayloadAsync(NetworkStream stream, CancellationToken stoppingToken)
+        private async Task<string> ReadJsonPayloadAsync(NetworkStream stream, CancellationToken stoppingToken,
+            int timeoutMs = 0)
         {
-            var buffer = new byte[256];
+            var buffer = new byte[4096];
             var sb = new StringBuilder();
-            var deadline = DateTime.UtcNow.AddMilliseconds(_sensorTimeoutMs * 2);
-            bool foundStart = false;
+            // Push 模式下傳入 0 表示不設 deadline，靠 stoppingToken 和 stream.ReadTimeout 控制
+            var deadline = timeoutMs > 0
+                ? DateTime.UtcNow.AddMilliseconds(timeoutMs)
+                : DateTime.MaxValue;
+            bool foundJsonStart = false;
             int braceDepth = 0;
+            char prevChar = '\0';
 
             while (!stoppingToken.IsCancellationRequested && DateTime.UtcNow < deadline)
             {
@@ -1093,17 +1220,24 @@ namespace OvenDataReceive.Services
 
                 foreach (char ch in chunk)
                 {
-                    if (ch == '{')
+                    if (!foundJsonStart)
                     {
-                        foundStart = true;
-                        braceDepth++;
-                    }
-                    else if (ch == '}' && foundStart)
-                    {
-                        braceDepth--;
-                        if (braceDepth == 0)
+                        // 只有 '{"' 連續出現才視為 JSON 物件開始（避免 binary 前綴干擾）
+                        if (prevChar == '{' && ch == '"')
                         {
-                            return ExtractJsonObject(sb.ToString());
+                            foundJsonStart = true;
+                            braceDepth = 1; // 已計入前面的 '{'
+                        }
+                        prevChar = ch;
+                    }
+                    else
+                    {
+                        if (ch == '{') braceDepth++;
+                        else if (ch == '}')
+                        {
+                            braceDepth--;
+                            if (braceDepth == 0)
+                                return ExtractJsonObject(sb.ToString());
                         }
                     }
                 }
@@ -1118,7 +1252,9 @@ namespace OvenDataReceive.Services
 
         private static string ExtractJsonObject(string raw)
         {
-            int start = raw.IndexOf('{');
+            // 以 '{"' 找 JSON 物件起點，避免被 binary 前綴中的 '{' 誤導
+            int start = raw.IndexOf("{\"");
+            if (start < 0) start = raw.IndexOf('{');
             int end = raw.LastIndexOf('}');
             if (start < 0 || end <= start)
                 throw new InvalidOperationException($"回應不是有效 JSON: {raw}");
